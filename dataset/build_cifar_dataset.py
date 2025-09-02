@@ -12,8 +12,8 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
-from argdantic import ArgParser
-from pydantic import BaseModel
+from argdantic import ArgParser  # type: ignore
+from pydantic import BaseModel  # type: ignore
 
 from common import PuzzleDatasetMetadata, dihedral_transform
 
@@ -24,11 +24,11 @@ cli = ArgParser()
 class DataProcessConfig(BaseModel):
     # CIFAR dataset configuration
     dataset_name: str = "CIFAR10"  # or "CIFAR100"
-    output_dir: str = "data/cifar-aug-1000"
+    output_dir: str = "data/cifar-aug-4"
     
     # Data augmentation
     seed: int = 42
-    num_aug: int = 1000
+    num_aug: int = 4 
     
     # Image processing
     image_size: int = 32  # CIFAR images are 32x32
@@ -94,7 +94,7 @@ def patches_to_sequence(patches: np.ndarray, max_seq_len: int) -> np.ndarray:
 def puzzle_hash(puzzle: dict):
     """Hash the puzzle for checking equivalence."""
     def _image_hash(image: np.ndarray):
-        buffer = [x.to_bytes(1) for x in image.shape]
+        buffer = [x.to_bytes(1, "little", signed=False) for x in image.shape]
         buffer.append(image.tobytes())
         return hashlib.sha256(b"".join(buffer)).hexdigest()
     
@@ -115,7 +115,8 @@ def convert_single_cifar_puzzle(results: dict, default_name: str, puzzle: dict, 
     # Convert
     dests = set(dest_mapping.values())
     converted = {dest: CIFARPuzzle(name, []) for dest in dests}
-    for example_type, examples in puzzle.items():
+    for example_type, item_example in puzzle.items():
+        examples = item_example['examples']
         dest = dest_mapping[example_type]
         converted[dest].examples.extend([(image_to_patches(example["image"]), example["label"]) for example in examples])
 
@@ -161,7 +162,8 @@ def convert_single_cifar_puzzle(results: dict, default_name: str, puzzle: dict, 
                 return image_to_patches(image.astype(np.uint8))
             
             # Check duplicate
-            augmented = {dest: CIFARPuzzle(f"{name}_{aug_repr}", [(_augment_image(image), label) for (image, label) in puzzle.examples]) for dest, puzzle in converted.items()}
+            # Use base name for IDs so augmented puzzles map to the same identifier
+            augmented = {dest: CIFARPuzzle(name, [(_augment_image(image), label) for (image, label) in puzzle.examples]) for dest, puzzle in converted.items()}
             h = puzzle_hash(augmented)
             if h not in hashes:
                 hashes.add(h)
@@ -205,7 +207,8 @@ def load_cifar_dataset(config: DataProcessConfig):
     
     # Process training data
     train_puzzles = []
-    for idx, (image, label) in enumerate(train_dataset):
+    for idx in range(len(train_dataset)):
+        image, label = train_dataset[idx]
         puzzle = {
             "train": {
                 "examples": [{"image": image.numpy().transpose(1, 2, 0) * 255, "label": label}]
@@ -215,7 +218,8 @@ def load_cifar_dataset(config: DataProcessConfig):
     
     # Process test data
     test_puzzles = []
-    for idx, (image, label) in enumerate(test_dataset):
+    for idx in range(len(test_dataset)):
+        image, label = test_dataset[idx]
         puzzle = {
             "test": {
                 "examples": [{"image": image.numpy().transpose(1, 2, 0) * 255, "label": label}]
