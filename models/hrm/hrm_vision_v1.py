@@ -7,9 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from models.layers import Attention, SwiGLU, RotaryEmbedding
-from models.common import CastedEmbedding, CastedLinear, CastedSparseEmbedding
-from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from models.layers import Attention, SwiGLU, RotaryEmbedding, CastedEmbedding, CastedLinear
+from models.sparse_embedding import CastedSparseEmbedding, CastedSparseEmbeddingSignSGD_Distributed
 
 
 @dataclass
@@ -62,7 +61,12 @@ class VisionPatchEmbedding(nn.Module):
         
         # Positional embedding for patches
         num_patches = (config.image_size // config.patch_size) ** 2
-        self.pos_embed = CastedEmbedding(num_patches, config.hidden_size, init_std=0.02)
+        self.pos_embed = CastedEmbedding(
+            num_patches,
+            config.hidden_size,
+            init_std=0.02,
+            cast_to=getattr(torch, config.forward_dtype)
+        )
         
         # Class token embedding (for classification)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
@@ -136,15 +140,16 @@ class HierarchicalReasoningModel_VisionV1Block(nn.Module):
         # Attention
         self.attention = Attention(
             hidden_size=config.hidden_size,
+            head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
-            forward_dtype=config.forward_dtype
+            num_key_value_heads=config.num_heads,
+            causal=False
         )
         
         # MLP
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
-            expansion=config.expansion,
-            forward_dtype=config.forward_dtype
+            expansion=config.expansion
         )
         
         # Layer norms
@@ -155,7 +160,8 @@ class HierarchicalReasoningModel_VisionV1Block(nn.Module):
         # Self-attention
         residual = x
         x = self.attn_norm(x)
-        x = self.attention(x, attention_mask=attention_mask)
+        # Vision encoder uses full attention without mask; pass no RoPE here (applied internally in Attention)
+        x = self.attention(None, x)
         x = residual + x
         
         # MLP
@@ -200,6 +206,9 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        # Vision token count (num_patches + 1 for class token)
+        self.num_patches = (self.config.image_size // self.config.patch_size) ** 2
+        self.seq_len_tokens = self.num_patches + 1
         
         # Vision-specific components
         self.patch_embedding = VisionPatchEmbedding(config)
@@ -209,12 +218,12 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         if self.config.pos_encodings == "rope":
             self.rotary_emb = RotaryEmbedding(
                 dim=self.config.hidden_size // self.config.num_heads,
-                max_position_embeddings=self.config.seq_len + 1,  # +1 for class token
+                max_position_embeddings=self.seq_len_tokens,  # match vision token length
                 base=self.config.rope_theta
             )
         elif self.config.pos_encodings == "learned":
             self.embed_pos = CastedEmbedding(
-                self.config.seq_len + 1,  # +1 for class token
+                self.seq_len_tokens,  # match vision token length
                 self.config.hidden_size,
                 init_std=0.02,
                 cast_to=self.forward_dtype
@@ -240,8 +249,8 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         dtype = self.forward_dtype
         
         return HierarchicalReasoningModel_VisionV1InnerCarry(
-            H_hidden=torch.zeros((batch_size, self.config.seq_len + 1, self.config.hidden_size), device=device, dtype=dtype),
-            L_hidden=torch.zeros((batch_size, self.config.seq_len + 1, self.config.hidden_size), device=device, dtype=dtype),
+            H_hidden=torch.zeros((batch_size, self.seq_len_tokens, self.config.hidden_size), device=device, dtype=dtype),
+            L_hidden=torch.zeros((batch_size, self.seq_len_tokens, self.config.hidden_size), device=device, dtype=dtype),
             step=0
         )
     
@@ -252,7 +261,7 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         
         # Apply positional encoding
         if self.config.pos_encodings == "rope":
-            cos, sin = self.rotary_emb(input_embeds)
+            cos, sin = self.rotary_emb()
             # Apply rotary embedding to attention layers
             # (This would be handled in the attention layers themselves)
         elif self.config.pos_encodings == "learned":
@@ -305,7 +314,7 @@ class HierarchicalReasoningModel_VisionV1(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
     
-    def forward(self, carry: HierarchicalReasoningModel_VisionV1Carry, batch: Dict[str, Tensor], return_keys: list = None) -> Tuple[HierarchicalReasoningModel_VisionV1Carry, Dict[str, Tensor], Dict[str, Tensor], Dict[str, Tensor], bool]:
+    def forward(self, carry: HierarchicalReasoningModel_VisionV1Carry, batch: Dict[str, Tensor], return_keys: Optional[list] = None) -> Tuple[HierarchicalReasoningModel_VisionV1Carry, Dict[str, Tensor], Dict[str, Tensor], Dict[str, Tensor], bool]:
         """Forward pass for vision HRM."""
         # Update current data
         carry.current_data = batch
