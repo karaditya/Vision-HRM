@@ -3,7 +3,7 @@ defaults:
   - arch: hrm_vision_v1
 
 # Data
-data_path: data/cifar-aug-1000
+data_path: data/cifar-aug-4
 
 # Hyperparameters
 global_batch_size: 64
