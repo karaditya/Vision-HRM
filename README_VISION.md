@@ -36,7 +36,7 @@ The vision HRM uses these key parameters:
 
 1. **Build the dataset**:
 ```bash
-python dataset/build_cifar_dataset.py --dataset_name CIFAR10
+python dataset/build_cifar_dataset.py --dataset-name CIFAR10
 ```
 
 2. **Train the model**:
