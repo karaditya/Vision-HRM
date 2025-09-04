@@ -135,17 +135,38 @@ def create_model(config: VisionPretrainConfig, train_metadata: PuzzleDatasetMeta
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers - simplified for vision tasks
-    if device == "cuda":
-        optimizers = [
-            AdamATan2(
-                model.parameters(),
-                lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
-            )
-        ]
+    # Optimizers - Try AdamATan2, fallback to AdamW if CUDA fails
+    optimizers = []
+    use_adamw = os.environ.get("FORCE_ADAMW", "false").lower() == "true"
+    
+    if device == "cuda" and not use_adamw:
+        try:
+            print("Attempting to create AdamATan2 optimizer...")
+            # Create a dummy optimizer to test if CUDA kernels work
+            dummy_param = nn.Parameter(torch.randn(1, device=device))
+            test_optimizer = AdamATan2([dummy_param], lr=1e-3)
+            dummy_param.grad = torch.zeros_like(dummy_param)
+            test_optimizer.step()  # This will fail if CUDA kernels don't work
+            
+            # If we get here, it works
+            optimizers = [
+                AdamATan2(
+                    model.parameters(),
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            ]
+            print("Successfully created AdamATan2 optimizer")
+            
+        except Exception as e:
+            print(f"AdamATan2 failed with error: {type(e).__name__}: {e}")
+            print("Falling back to AdamW optimizer")
+            use_adamw = True
     else:
+        use_adamw = True
+        
+    if use_adamw:
         optimizers = [
             torch.optim.AdamW(
                 model.parameters(),
@@ -154,6 +175,8 @@ def create_model(config: VisionPretrainConfig, train_metadata: PuzzleDatasetMeta
                 betas=(config.beta1, config.beta2)
             )
         ]
+        print("Using AdamW optimizer")
+    
     optimizer_lrs = [
         config.lr
     ]
