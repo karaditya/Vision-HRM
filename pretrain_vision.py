@@ -237,6 +237,7 @@ def train_batch(config: VisionPretrainConfig, train_state: TrainState, batch: An
 
     # To device
     model_device = next(train_state.model.parameters()).device
+    print(f"Model is on device: {model_device}")
     batch = {k: v.to(model_device) for k, v in batch.items()}
 
     # Reinitialize carry every batch to avoid backprop-through-graph across steps
