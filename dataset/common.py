@@ -23,6 +23,11 @@ class PuzzleDatasetMetadata(pydantic.BaseModel):
 
     sets: List[str]
 
+    # Vision-specific metadata (optional for backward compatibility)
+    num_classes: Optional[int] = None
+    image_size: Optional[int] = None
+    patch_size: Optional[int] = None
+    num_channels: Optional[int] = None
 
 def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     """8 dihedral symmetries by rotate, flip and mirror"""

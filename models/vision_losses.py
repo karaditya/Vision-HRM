@@ -1,30 +1,90 @@
+from typing import Any, Tuple, Dict, Sequence, Optional
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any
+from torch import nn
 
 
 class VisionClassificationLossHead(nn.Module):
-    """Loss head for vision classification tasks."""
+    """Loss head for vision classification tasks with HRM."""
     
-    def __init__(self, model: nn.Module, loss_type: str = "cross_entropy", **kwargs):
+    def __init__(self, model: nn.Module, loss_type: str = "cross_entropy"):
         super().__init__()
         self.model = model
-        self.loss_type = loss_type
         
-    def forward(self, carry: Any, batch: Dict[str, torch.Tensor], return_keys: Any = None) -> tuple:
-        """Forward pass with loss computation."""
-        # Forward through model
-        carry, metrics, preds, _, all_finish = self.model(carry, batch, return_keys)
+    def initial_carry(self, *args, **kwargs):
+        return self.model.initial_carry(*args, **kwargs)
 
-        # Training loop expects (carry, loss, metrics, preds, all_finish)
-        loss = metrics.get("loss")
-        # Remove loss from metrics dict when returning metrics separately
-        if isinstance(metrics, dict) and "loss" in metrics:
-            metrics = {k: v for k, v in metrics.items() if k != "loss"}
+    def forward(
+        self,
+        return_keys: Sequence[str],
+        **model_kwargs,
+    ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        """Forward pass for vision classification."""
+        
+        # Model forward pass
+        new_carry, outputs = self.model(**model_kwargs)
+        
+        # Get labels - single label per example
+        labels = new_carry.current_data["labels"]  # Shape: (batch_size, 1)
+        labels = labels.squeeze(-1)  # Shape: (batch_size,)
+        
+        # Classification logits from the model
+        classification_logits = outputs["logits"]  # Shape: (batch_size, num_classes)
 
-        return carry, loss, metrics, preds, all_finish
+        # Compute metrics
+        with torch.no_grad():
+            predictions = torch.argmax(classification_logits, dim=-1)
+            is_correct = (predictions == labels)
+            
+            # Only consider halted sequences for metrics
+            valid_metrics = new_carry.halted
+            
+            metrics = {
+                "count": valid_metrics.sum(),
+                "accuracy": torch.where(valid_metrics, is_correct.to(torch.float32), 0).sum(),
+                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == is_correct)).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+            }
+            
+            # Add predictions to outputs
+            outputs["predictions"] = predictions
 
-    def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        """Proxy to the underlying model's initial_carry."""
-        return getattr(self.model, "initial_carry")(batch)  # type: ignore[attr-defined]
+        # Compute losses - only for halted sequences
+        classification_mask = new_carry.halted
+        if classification_mask.any():
+            masked_logits = classification_logits[classification_mask]
+            masked_labels = labels[classification_mask]
+            classification_loss = F.cross_entropy(masked_logits, masked_labels, reduction="sum")
+        else:
+            classification_loss = torch.tensor(0.0, device=classification_logits.device)
+        
+        # Q-learning loss for halting decision
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"], 
+            is_correct.to(outputs["q_halt_logits"].dtype), 
+            reduction="sum"
+        )
+
+        metrics.update({
+            "classification_loss": classification_loss.detach(),
+            "q_halt_loss": q_halt_loss.detach(),
+        })
+
+        # Q continue loss (for bootstrapping)
+        q_continue_loss = torch.tensor(0.0, device=classification_logits.device)
+        if "target_q_continue" in outputs:
+            q_continue_loss = F.binary_cross_entropy_with_logits(
+                outputs["q_continue_logits"], 
+                outputs["target_q_continue"], 
+                reduction="sum"
+            )
+            metrics["q_continue_loss"] = q_continue_loss.detach()
+
+        # Total loss
+        total_loss = classification_loss + 0.5 * (q_halt_loss + q_continue_loss)
+
+        # Filter outputs for return
+        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()

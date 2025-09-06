@@ -1,349 +1,258 @@
-from typing import Dict, Tuple, Any, Optional
+from typing import Tuple, List, Dict
 from dataclasses import dataclass
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
+from torch import nn
+from pydantic import BaseModel
 
-from models.layers import Attention, SwiGLU, RotaryEmbedding, CastedEmbedding, CastedLinear
-from models.sparse_embedding import CastedSparseEmbedding, CastedSparseEmbeddingSignSGD_Distributed
+from models.common import trunc_normal_init_
+from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.sparse_embedding import CastedSparseEmbedding
 
 
 @dataclass
-class HierarchicalReasoningModel_VisionV1Config:
-    # Model dimensions
-    hidden_size: int
-    num_heads: int
-    expansion: int
+class HierarchicalReasoningModel_VisionV1InnerCarry:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+@dataclass
+class HierarchicalReasoningModel_VisionV1Carry:
+    inner_carry: HierarchicalReasoningModel_VisionV1InnerCarry
+    steps: torch.Tensor
+    halted: torch.Tensor
+    current_data: Dict[str, torch.Tensor]
+
+
+class HierarchicalReasoningModel_VisionV1Config(BaseModel):
+    batch_size: int
+    seq_len: int
+    puzzle_emb_ndim: int = 0
+    num_puzzle_identifiers: int
+    vocab_size: int
+    num_classes: int = 10
     
-    # Architecture
-    H_layers: int
-    L_layers: int
     H_cycles: int
     L_cycles: int
+    H_layers: int
+    L_layers: int
     
-    # Vision-specific
-    vocab_size: int
-    seq_len: int
-    num_classes: int
-    patch_size: int
-    image_size: int
+    hidden_size: int
+    expansion: float
+    num_heads: int
+    pos_encodings: str
     
-    # Puzzle embeddings
-    num_puzzle_identifiers: int
-    puzzle_emb_ndim: int
-    
-    # ACT parameters
-    halt_exploration_prob: float
-    halt_max_steps: int
-    
-    # Training
-    batch_size: int
-    forward_dtype: str = "float16"
-    
-    # Positional encoding
-    pos_encodings: str = "rope"
+    rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-
-
-class VisionPatchEmbedding(nn.Module):
-    """Convert image patches to embeddings."""
-    
-    def __init__(self, config: HierarchicalReasoningModel_VisionV1Config):
-        super().__init__()
-        self.config = config
-        
-        # Patch embedding layer
-        patch_dim = config.patch_size * config.patch_size * 3  # RGB channels
-        self.patch_embed = CastedLinear(patch_dim, config.hidden_size, bias=True)
-        
-        # Positional embedding for patches
-        num_patches = (config.image_size // config.patch_size) ** 2
-        self.pos_embed = CastedEmbedding(
-            num_patches,
-            config.hidden_size,
-            init_std=0.02,
-            cast_to=getattr(torch, config.forward_dtype)
-        )
-        
-        # Class token embedding (for classification)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
-        
-    def forward(self, x: Tensor) -> Tensor:
-        # x shape: (batch_size, seq_len) where seq_len = num_patches * patch_dim
-        batch_size = x.shape[0]
-        
-        # Reshape to patches
-        patch_dim = self.config.patch_size * self.config.patch_size * 3
-        num_patches = (self.config.image_size // self.config.patch_size) ** 2
-        
-        # Truncate or pad to exact patch size
-        if x.shape[1] > num_patches * patch_dim:
-            x = x[:, :num_patches * patch_dim]
-        elif x.shape[1] < num_patches * patch_dim:
-            # Pad with zeros
-            pad_size = num_patches * patch_dim - x.shape[1]
-            x = torch.cat([x, torch.zeros(batch_size, pad_size, device=x.device, dtype=x.dtype)], dim=1)
-        
-        # Reshape to patches
-        x = x.view(batch_size, num_patches, patch_dim)
-        
-        # Normalize pixel values to [0, 1] range
-        x = x.float() / 255.0
-        
-        # Project patches to embeddings
-        x = self.patch_embed(x)
-        
-        # Add positional embeddings
-        pos_ids = torch.arange(num_patches, device=x.device).unsqueeze(0)
-        x = x + self.pos_embed(pos_ids)
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
-        
-        return x
-
-
-class VisionClassificationHead(nn.Module):
-    """Classification head for vision tasks."""
-    
-    def __init__(self, config: HierarchicalReasoningModel_VisionV1Config):
-        super().__init__()
-        self.config = config
-        
-        # Global average pooling + classification head
-        self.norm = nn.LayerNorm(config.hidden_size)
-        self.classifier = CastedLinear(config.hidden_size, config.num_classes, bias=True)
-        
-    def forward(self, x: Tensor) -> Tensor:
-        # x shape: (batch_size, seq_len, hidden_size)
-        # Use class token (first token) for classification
-        cls_token = x[:, 0, :]  # (batch_size, hidden_size)
-        
-        # Normalize and classify
-        cls_token = self.norm(cls_token)
-        logits = self.classifier(cls_token)
-        
-        return logits
+    halt_max_steps: int
+    halt_exploration_prob: float
+    forward_dtype: str = "bfloat16"
 
 
 class HierarchicalReasoningModel_VisionV1Block(nn.Module):
-    """Single block for vision HRM."""
-    
-    def __init__(self, config: HierarchicalReasoningModel_VisionV1Config):
+    def __init__(self, config: HierarchicalReasoningModel_VisionV1Config) -> None:
         super().__init__()
-        self.config = config
-        
-        # Attention
-        self.attention = Attention(
+
+        self.self_attn = Attention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
             causal=False
         )
-        
-        # MLP
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
-            expansion=config.expansion
+            expansion=config.expansion,
         )
-        
-        # Layer norms
-        self.attn_norm = nn.LayerNorm(config.hidden_size)
-        self.mlp_norm = nn.LayerNorm(config.hidden_size)
-        
-    def forward(self, x: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
-        # Self-attention
-        residual = x
-        x = self.attn_norm(x)
-        # Vision encoder uses full attention without mask; pass no RoPE here (applied internally in Attention)
-        x = self.attention(None, x)
-        x = residual + x
-        
-        # MLP
-        residual = x
-        x = self.mlp_norm(x)
-        x = self.mlp(x)
-        x = residual + x
-        
-        return x
+        self.norm_eps = config.rms_norm_eps
 
-
-class HierarchicalReasoningModel_VisionV1ReasoningModule(nn.Module):
-    """Reasoning module for vision tasks."""
-    
-    def __init__(self, layers: list):
-        super().__init__()
-        self.layers = nn.ModuleList(layers)
-        
-    def forward(self, hidden_states: Tensor, input_injection: Tensor, **kwargs) -> Tensor:
-        # Input injection (add)
-        hidden_states = hidden_states + input_injection
-        
-        # Apply layers
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
-            
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Post-norm transformer block
+        hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
         return hidden_states
 
 
-@dataclass
-class HierarchicalReasoningModel_VisionV1InnerCarry:
-    """Carry state for vision HRM inner model."""
-    H_hidden: Tensor
-    L_hidden: Tensor
-    step: int
+class HierarchicalReasoningModel_VisionV1ReasoningModule(nn.Module):
+    def __init__(self, layers: List[HierarchicalReasoningModel_VisionV1Block]):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+        # Input injection then layers
+        hidden_states = hidden_states + input_injection
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        return hidden_states
 
 
 class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
-    """Inner model for vision HRM."""
-    
     def __init__(self, config: HierarchicalReasoningModel_VisionV1Config) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
-        # Vision token count (num_patches + 1 for class token)
-        self.num_patches = (self.config.image_size // self.config.patch_size) ** 2
-        self.seq_len_tokens = self.num_patches + 1
-        
-        # Vision-specific components
-        self.patch_embedding = VisionPatchEmbedding(config)
-        self.classification_head = VisionClassificationHead(config)
-        
-        # Positional encoding
+
+        # Embedding layers
+        self.embed_scale = math.sqrt(self.config.hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.classification_head = CastedLinear(self.config.hidden_size, self.config.num_classes, bias=True)
+        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+
+        # Puzzle embeddings
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
+        if self.config.puzzle_emb_ndim > 0:
+            self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
+                                                    batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
+
+        # Position encodings
         if self.config.pos_encodings == "rope":
-            self.rotary_emb = RotaryEmbedding(
-                dim=self.config.hidden_size // self.config.num_heads,
-                max_position_embeddings=self.seq_len_tokens,  # match vision token length
-                base=self.config.rope_theta
-            )
+            self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
+                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              base=self.config.rope_theta)
         elif self.config.pos_encodings == "learned":
-            self.embed_pos = CastedEmbedding(
-                self.seq_len_tokens,  # match vision token length
-                self.config.hidden_size,
-                init_std=0.02,
-                cast_to=self.forward_dtype
-            )
-        else:
-            raise NotImplementedError()
+            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+
+        # Hierarchical reasoning modules
+        self.H_level = HierarchicalReasoningModel_VisionV1ReasoningModule(layers=[HierarchicalReasoningModel_VisionV1Block(self.config) for _ in range(self.config.H_layers)])
+        self.L_level = HierarchicalReasoningModel_VisionV1ReasoningModule(layers=[HierarchicalReasoningModel_VisionV1Block(self.config) for _ in range(self.config.L_layers)])
         
-        # Reasoning Layers
-        self.H_level = HierarchicalReasoningModel_VisionV1ReasoningModule(
-            layers=[HierarchicalReasoningModel_VisionV1Block(self.config) for _ in range(self.config.H_layers)]
-        )
-        self.L_level = HierarchicalReasoningModel_VisionV1ReasoningModule(
-            layers=[HierarchicalReasoningModel_VisionV1Block(self.config) for _ in range(self.config.L_layers)]
-        )
-        
-        # Projection layers
-        self.H_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
-        self.L_proj = CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)
-        
-    def empty_carry(self, batch_size: int) -> HierarchicalReasoningModel_VisionV1InnerCarry:
-        """Create empty carry state."""
-        device = next(self.parameters()).device
-        dtype = self.forward_dtype
-        
-        return HierarchicalReasoningModel_VisionV1InnerCarry(
-            H_hidden=torch.zeros((batch_size, self.seq_len_tokens, self.config.hidden_size), device=device, dtype=dtype),
-            L_hidden=torch.zeros((batch_size, self.seq_len_tokens, self.config.hidden_size), device=device, dtype=dtype),
-            step=0
-        )
-    
-    def forward(self, carry: HierarchicalReasoningModel_VisionV1InnerCarry, batch: Dict[str, Tensor]) -> Tuple[HierarchicalReasoningModel_VisionV1InnerCarry, Tensor, Tensor]:
-        """Forward pass for vision HRM."""
-        # Get input embeddings
-        input_embeds = self.patch_embedding(batch["inputs"])
-        
-        # Apply positional encoding
-        if self.config.pos_encodings == "rope":
-            cos, sin = self.rotary_emb()
-            # Apply rotary embedding to attention layers
-            # (This would be handled in the attention layers themselves)
-        elif self.config.pos_encodings == "learned":
-            pos_ids = torch.arange(input_embeds.shape[1], device=input_embeds.device).unsqueeze(0)
-            input_embeds = input_embeds + self.embed_pos(pos_ids)
-        
-        # Hierarchical reasoning
-        for _ in range(self.config.H_cycles):
-            # High-level reasoning
-            carry.H_hidden = self.H_level(carry.H_hidden, input_embeds)
+        # Initial states
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+
+        # Initialize Q head for stable training
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)  # Start with preference for not halting
+
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+        """Convert input tokens and puzzle IDs to embeddings."""
+        embedding = self.embed_tokens(input.to(torch.int32))
+
+        # Add puzzle embeddings if configured
+        if self.config.puzzle_emb_ndim > 0:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
-            # Low-level reasoning
-            for _ in range(self.config.L_cycles):
-                carry.L_hidden = self.L_level(carry.L_hidden, self.H_proj(carry.H_hidden))
-        
-        # Classification
-        logits = self.classification_head(carry.L_hidden)
-        
-        # Update step
-        carry.step += 1
-        
-        return carry, logits, torch.tensor(0.0, device=logits.device)  # Dummy halt probability
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
+            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
 
-@dataclass
-class HierarchicalReasoningModel_VisionV1Carry:
-    """Carry state for vision HRM."""
-    inner_carry: HierarchicalReasoningModel_VisionV1InnerCarry
-    steps: Tensor
-    halted: Tensor
-    current_data: Dict[str, Tensor]
+        # Add position embeddings
+        if self.config.pos_encodings == "learned":
+            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+
+        return self.embed_scale * embedding
+
+    def empty_carry(self, batch_size: int):
+        """Create empty carry state."""
+        return HierarchicalReasoningModel_VisionV1InnerCarry(
+            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+        )
+        
+    def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_VisionV1InnerCarry):
+        """Reset carry state for halted sequences."""
+        return HierarchicalReasoningModel_VisionV1InnerCarry(
+            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+        )
+
+    def forward(self, carry: HierarchicalReasoningModel_VisionV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_VisionV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        seq_info = dict(
+            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+        )
+
+        # Input encoding
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+
+        # Hierarchical reasoning iterations (no grad)
+        with torch.no_grad():
+            z_H, z_L = carry.z_H, carry.z_L
+
+            for h_step in range(self.config.H_cycles):
+                for l_step in range(self.config.L_cycles):
+                    if not ((h_step == self.config.H_cycles - 1) and (l_step == self.config.L_cycles - 1)):
+                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+
+                if not (h_step == self.config.H_cycles - 1):
+                    z_H = self.H_level(z_H, z_L, **seq_info)
+
+        # Final step with gradients
+        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_H = self.H_level(z_H, z_L, **seq_info)
+
+        # Global average pooling for classification
+        vision_features = z_H[:, self.puzzle_emb_len:]  # Exclude puzzle embedding positions
+        pooled_features = vision_features.mean(dim=1)
+        
+        # Output heads
+        new_carry = HierarchicalReasoningModel_VisionV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        classification_logits = self.classification_head(pooled_features)
+        q_logits = self.q_head(pooled_features).to(torch.float32)
+        
+        return new_carry, classification_logits, (q_logits[..., 0], q_logits[..., 1])
 
 
 class HierarchicalReasoningModel_VisionV1(nn.Module):
-    """Vision HRM with ACT wrapper."""
-    
+    """Vision transformer with hierarchical reasoning and adaptive computation."""
+
     def __init__(self, config_dict: dict):
         super().__init__()
         self.config = HierarchicalReasoningModel_VisionV1Config(**config_dict)
         self.inner = HierarchicalReasoningModel_VisionV1_Inner(self.config)
-    
-    def initial_carry(self, batch: Dict[str, Tensor]):
-        """Initialize carry state."""
+
+    @property
+    def puzzle_emb(self):
+        return self.inner.puzzle_emb
+
+    def initial_carry(self, batch: Dict[str, torch.Tensor]):
+        """Initialize carry state for a new batch."""
         batch_size = batch["inputs"].shape[0]
-        
+
         return HierarchicalReasoningModel_VisionV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),
+            steps=torch.zeros((batch_size, ), dtype=torch.int32),
+            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Start halted
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
-    
-    def forward(self, carry: HierarchicalReasoningModel_VisionV1Carry, batch: Dict[str, Tensor], return_keys: Optional[list] = None) -> Tuple[HierarchicalReasoningModel_VisionV1Carry, Dict[str, Tensor], Dict[str, Tensor], Dict[str, Tensor], bool]:
-        """Forward pass for vision HRM."""
-        # Update current data
-        carry.current_data = batch
         
-        # Forward through inner model
-        carry.inner_carry, logits, halt_prob = self.inner(carry.inner_carry, batch)
-        
-        # Compute loss and metrics
-        labels = batch["labels"]
-        if labels.dim() > 1:
-            # If labels are sequences, use the first token (class token position)
-            labels = labels[:, 0]
-        
-        loss = F.cross_entropy(logits, labels.long())
-        
-        # Compute accuracy
-        preds = torch.argmax(logits, dim=-1)
-        accuracy = (preds == labels.long()).float().mean()
-        
-        metrics = {
-            "loss": loss,
-            "accuracy": accuracy,
-            "count": torch.tensor(1.0, device=loss.device)
+    def forward(self, carry: HierarchicalReasoningModel_VisionV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_VisionV1Carry, Dict[str, torch.Tensor]]:
+        # Update carry state
+        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        new_steps = torch.where(carry.halted, 0, carry.steps)
+        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+
+        # Forward pass
+        new_inner_carry, classification_logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+
+        outputs = {
+            "logits": classification_logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits
         }
         
-        # Return predictions
-        preds_dict = {"logits": logits, "predictions": preds}
-        
-        # Always halt for vision tasks (single forward pass)
-        all_finish = True
-        
-        return carry, metrics, preds_dict, {}, all_finish
+        # ACT halting logic
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= self.config.halt_max_steps
+            halted = is_last_step
+
+            # Training-time ACT
+            if self.training and (self.config.halt_max_steps > 1):
+                halted = halted | (q_halt_logits > q_continue_logits)
+
+                # Exploration
+                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                halted = halted & (new_steps >= min_halt_steps)
+
+                # Target Q for next step
+                next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
+                outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+        return HierarchicalReasoningModel_VisionV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
