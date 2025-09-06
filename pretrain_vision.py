@@ -12,11 +12,11 @@ from torch.utils.data import DataLoader
 
 import tqdm
 import wandb
-import coolname
-import hydra
-import pydantic
-from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+import coolname # type: ignore
+import hydra # type: ignore[import]
+import pydantic # type: ignore
+from omegaconf import DictConfig # type: ignore
+from adam_atan2 import AdamATan2 # type: ignore
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -106,6 +106,8 @@ def create_dataloader(config: VisionPretrainConfig, split: str, rank: int, world
 
 
 def create_model(config: VisionPretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Creating model on device: {device}")
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
 
@@ -114,17 +116,17 @@ def create_model(config: VisionPretrainConfig, train_metadata: PuzzleDatasetMeta
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
+        # Vision model is non-autoregressive; no 'causal' flag in config
     )
 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
+    with torch.device(device):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
-        if "DISABLE_COMPILE" not in os.environ:
+        if device == "cuda" and "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model, dynamic=False)  # type: ignore
 
         # Broadcast parameters from rank 0
@@ -133,16 +135,48 @@ def create_model(config: VisionPretrainConfig, train_metadata: PuzzleDatasetMeta
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers - simplified for vision tasks
-    optimizers = [
-        AdamATan2(
-            model.parameters(),
-
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.weight_decay,
-            betas=(config.beta1, config.beta2)
-        )
-    ]
+    # Optimizers - Try AdamATan2, fallback to AdamW if CUDA fails
+    optimizers = []
+    use_adamw = os.environ.get("FORCE_ADAMW", "false").lower() == "true"
+    
+    if device == "cuda" and not use_adamw:
+        try:
+            print("Attempting to create AdamATan2 optimizer...")
+            # Create a dummy optimizer to test if CUDA kernels work
+            dummy_param = nn.Parameter(torch.randn(1, device=device))
+            test_optimizer = AdamATan2([dummy_param], lr=1e-3)
+            dummy_param.grad = torch.zeros_like(dummy_param)
+            test_optimizer.step()  # This will fail if CUDA kernels don't work
+            
+            # If we get here, it works
+            optimizers = [
+                AdamATan2(
+                    model.parameters(),
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            ]
+            print("Successfully created AdamATan2 optimizer")
+            
+        except Exception as e:
+            print(f"AdamATan2 failed with error: {type(e).__name__}: {e}")
+            print("Falling back to AdamW optimizer")
+            use_adamw = True
+    else:
+        use_adamw = True
+        
+    if use_adamw:
+        optimizers = [
+            torch.optim.AdamW(
+                model.parameters(),
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2)
+            )
+        ]
+        print("Using AdamW optimizer")
+    
     optimizer_lrs = [
         config.lr
     ]
@@ -202,12 +236,12 @@ def train_batch(config: VisionPretrainConfig, train_state: TrainState, batch: An
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    model_device = next(train_state.model.parameters()).device
+    print(f"Model is on device: {model_device}")
+    batch = {k: v.to(model_device) for k, v in batch.items()}
 
-    # Init carry if it is None
-    if train_state.carry is None:
-        with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+    # Reinitialize carry every batch to avoid backprop-through-graph across steps
+    train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
@@ -264,11 +298,11 @@ def evaluate(config: VisionPretrainConfig, train_state: TrainState, eval_loader:
         metric_global_batch_size = [0 for _ in range(len(set_ids))]
         
         carry = None
+        model_device = next(train_state.model.parameters()).device
         for set_name, batch, global_batch_size in eval_loader:
             # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
-                carry = train_state.model.initial_carry(batch)  # type: ignore
+            batch = {k: v.to(model_device) for k, v in batch.items()}
+            carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
             while True:
@@ -290,7 +324,7 @@ def evaluate(config: VisionPretrainConfig, train_state: TrainState, eval_loader:
             
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
+                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device=model_device)
                 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             metric_global_batch_size[set_id] += global_batch_size
@@ -321,7 +355,7 @@ def evaluate(config: VisionPretrainConfig, train_state: TrainState, eval_loader:
 
 
 def save_code_and_config(config: VisionPretrainConfig):
-    if config.checkpoint_path is None or wandb.run is None:
+    if config.checkpoint_path is None or getattr(wandb, "run", None) is None:  # type: ignore[attr-defined]
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
@@ -343,7 +377,9 @@ def save_code_and_config(config: VisionPretrainConfig):
         yaml.dump(config.model_dump(), f)
 
     # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    run_obj = getattr(wandb, "run", None)  # type: ignore[attr-defined]
+    if run_obj is not None:
+        run_obj.log_code(config.checkpoint_path)
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> VisionPretrainConfig:
@@ -406,7 +442,7 @@ def launch(hydra_config: DictConfig):
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
 
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)  # type: ignore[attr-defined]
         save_code_and_config(config)
 
     # Training Loop
@@ -419,7 +455,7 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                wandb.log(metrics, step=train_state.step)  # type: ignore[attr-defined]
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
 
         ############ Evaluation
@@ -427,7 +463,7 @@ def launch(hydra_config: DictConfig):
         metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
         if RANK == 0 and metrics is not None:
-            wandb.log(metrics, step=train_state.step)
+            wandb.log(metrics, step=train_state.step)  # type: ignore[attr-defined]
             
         ############ Checkpointing
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
@@ -436,8 +472,8 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    wandb.finish()  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":
-    launch()
+    launch()  # type: ignore[misc]

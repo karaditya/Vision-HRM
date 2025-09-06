@@ -6,9 +6,20 @@ import torch.nn.functional as F
 
 try:
     from flash_attn_interface import flash_attn_func  # type: ignore[import]
-except ImportError:
-    # Fallback to FlashAttention 2
-    from flash_attn import flash_attn_func  # type: ignore[import]
+except Exception:
+    try:
+        # Fallback to FlashAttention 2
+        from flash_attn import flash_attn_func  # type: ignore[import]
+    except Exception:
+        # Final fallback: use PyTorch scaled dot-product attention with same call signature
+        def flash_attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False):  # type: ignore[no-redef]
+            # Inputs expected as [batch, seq, heads, dim]
+            batch_size, seq_len, num_heads, head_dim = q.shape
+            q_ = q.permute(0, 2, 1, 3)
+            k_ = k.permute(0, 2, 1, 3)
+            v_ = v.permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=None, is_causal=causal)
+            return out.permute(0, 2, 1, 3)
 
 from models.common import trunc_normal_init_
 
