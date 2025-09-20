@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
 
 import wandb
 import coolname
@@ -73,9 +74,9 @@ def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: 
         torch.from_numpy(labels).long()
     )
 
-    sampler = None
+    sampler: Optional[DistributedSampler] = None
     if world_size > 1:
-        sampler = torch.utils.data.DistributedSampler(
+        sampler = DistributedSampler(
             dataset, num_replicas=world_size, rank=rank, shuffle=(split == "train")
         )
 
@@ -115,7 +116,7 @@ def create_model(config: VisionConfig, train_metadata: CIFARDatasetMetadata, wor
     model.to(device)
 
     if device.type == "cuda" and "DISABLE_COMPILE" not in os.environ:
-        model = torch.compile(model, dynamic=False)
+        model = torch.compile(model, dynamic=False) # type: ignore
 
     if world_size > 1 and dist.is_initialized():
         for p in model.parameters():
@@ -148,8 +149,19 @@ def init_train_state(config: VisionConfig, train_metadata: CIFARDatasetMetadata,
         "inputs": torch.zeros((batch_size, train_metadata.patches_per_image * train_metadata.patch_dim)),
         "labels": torch.zeros((batch_size,), dtype=torch.long)
     }
-    carry = model.initial_carry(dummy_batch)
+    carry = model.initial_carry(dummy_batch) # type: ignore
     return TrainState(step=0, total_steps=total_steps, model=model, optimizers=optimizers, optimizer_lrs=optimizer_lrs, carry=carry)
+
+def detach_carry(carry: Any) -> Any:
+    """Detach tensors in carry to prevent gradient tracking."""
+    if isinstance(carry, torch.Tensor):
+        return carry.detach()
+    elif isinstance(carry, (list, tuple)):
+        return type(carry)(detach_carry(x) for x in carry)
+    elif isinstance(carry, dict):
+        return {k: detach_carry(v) for k, v in carry.items()}
+    return carry
+
 
 def train_batch(train_state: TrainState, batch: tuple, config: VisionConfig, rank: int, world_size: int):
     train_state.step += 1
@@ -160,8 +172,16 @@ def train_batch(train_state: TrainState, batch: tuple, config: VisionConfig, ran
     inputs, labels = batch
     batch_dict = {"inputs": inputs.to(model_device), "labels": labels.to(model_device)}
 
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch_dict, return_keys=config.eval_save_outputs)
-    loss.backward()
+    # Reinitialize carry every batch to avoid backprop-through-graph across steps
+    train_state.carry = train_state.model.initial_carry(batch_dict)  # type: ignore
+
+    train_state.carry, loss, metrics, _, _ = train_state.model(
+        carry=train_state.carry,
+        batch=batch_dict,
+        return_keys=config.eval_save_outputs
+    )
+    # Backward
+    (loss / config.global_batch_size).backward()
 
     if world_size > 1 and dist.is_initialized():
         for p in train_state.model.parameters():
@@ -187,7 +207,7 @@ def train_batch(train_state: TrainState, batch: tuple, config: VisionConfig, ran
             vals /= world_size
         if rank == 0:
             out = {f"train/{k}": v.item() for k, v in zip(keys, vals)}
-            out["train/lr"] = lr_this_step
+            out["train/lr"] = lr_this_step # type: ignore
             return out
 
 def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_size: int):
@@ -198,7 +218,7 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
             model_device = next(train_state.model.parameters()).device
             inputs, labels = batch
             batch_dict = {"inputs": inputs.to(model_device), "labels": labels.to(model_device)}
-            carry = train_state.model.initial_carry(batch_dict)
+            carry = train_state.model.initial_carry(batch_dict) # type: ignore
             _, _, metrics, _, _ = train_state.model(carry=carry, batch=batch_dict, return_keys=[])
             all_metrics.append(metrics)
 
@@ -232,11 +252,11 @@ def main(hydra_config: DictConfig):
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    config = VisionConfig(**OmegaConf.to_container(hydra_config, resolve=True))
+    config = VisionConfig(**OmegaConf.to_container(hydra_config, resolve=True)) # type: ignore
     if config.run_name is None:
         config.run_name = f"{config.arch.name.split('.')[-1]}-{coolname.generate_slug(2)}"
     if config.checkpoint_path is None:
-        config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
+        config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name) # type: ignore
 
     torch.manual_seed(config.seed + RANK)
     np.random.seed(config.seed + RANK)
@@ -254,7 +274,7 @@ def main(hydra_config: DictConfig):
         if RANK == 0:
             print(f"\n--- Epoch {epoch+1}/{config.epochs} ---")
         if hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(epoch)
+            train_loader.sampler.set_epoch(epoch) # type: ignore
 
         train_state.model.train()
         pbar = tqdm(train_loader, disable=(RANK != 0))
