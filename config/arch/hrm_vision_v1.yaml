@@ -7,23 +7,24 @@ loss:
 num_classes: 10  # CIFAR-10 (change to 100 for CIFAR-100)
 patch_size: 4
 image_size: 32
+vocab_size: 1000  # Default for patch embeddings
+seq_len: 192      # (32 // 4) ** 2 * (4 * 4 * 3) = 16 * 12
 
-# ACT parameters (simplified for vision)
-halt_exploration_prob: 0.0  # No exploration needed for vision
-halt_max_steps: 1  # Single forward pass
+
+# ACT parameters
+halt_exploration_prob: 0.0  # No exploration for vision
+halt_max_steps: 1          # Single forward pass
 
 # Architecture
 H_cycles: 2
 L_cycles: 2
-
 H_layers: 4
 L_layers: 4
-
 hidden_size: 512
 num_heads: 8
 expansion: 4
 
-# Puzzle embeddings (minimal for vision)
-puzzle_emb_ndim: 64
-
+# Positional encoding
 pos_encodings: rope
+rope_theta: 10000.0
+forward_dtype: float16

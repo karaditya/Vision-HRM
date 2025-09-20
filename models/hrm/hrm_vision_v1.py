@@ -31,10 +31,6 @@ class HierarchicalReasoningModel_VisionV1Config:
     patch_size: int
     image_size: int
     
-    # Puzzle embeddings
-    num_puzzle_identifiers: int
-    puzzle_emb_ndim: int
-    
     # ACT parameters
     halt_exploration_prob: float
     halt_max_steps: int
