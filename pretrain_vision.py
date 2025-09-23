@@ -118,9 +118,15 @@ def create_model(config: VisionConfig, train_metadata: CIFARDatasetMetadata, wor
     if device.type == "cuda" and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model, dynamic=False) # type: ignore
 
-    if world_size > 1 and dist.is_initialized():
-        for p in model.parameters():
-            dist.broadcast(p.data, src=0)
+    # if world_size > 1 and dist.is_initialized():
+    #     for p in model.parameters():
+    #         dist.broadcast(p.data, src=0)
+
+
+    if world_size > 1:
+        with torch.no_grad():
+            for param in list(model.parameters()) + list(model.buffers()):
+                dist.broadcast(param, src=0)  # Parameters AND buffers!
 
     optimizers = [AdamW(
         model.parameters(),
@@ -187,6 +193,8 @@ def train_batch(train_state: TrainState, batch: tuple, config: VisionConfig, ran
         for p in train_state.model.parameters():
             if p.grad is not None:
                 dist.all_reduce(p.grad)
+
+    
 
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):

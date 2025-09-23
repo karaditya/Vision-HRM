@@ -1,13 +1,18 @@
 from typing import Dict
 import os
+from tqdm import tqdm
 import json
 import numpy as np
+
 import torch
 import torchvision
 import torchvision.transforms as transforms
+
 from argdantic import ArgParser
 from pydantic import BaseModel
 from common import CIFARDatasetMetadata
+
+
 
 cli = ArgParser()
 
@@ -90,25 +95,28 @@ class CIFARProcessor:
             all_patches = []
             all_labels = []
             
-            for idx in range(len(dataset)):
+            # Process each image into patch sequences
+            for idx in tqdm(range(len(dataset)), desc=f"Processing {split} data"):
                 image, label = dataset[idx]
                 patches = self.image_to_patches(image)
                 
-                # Store original
-                all_patches.append(patches)
-                all_labels.append(np.full(patches.shape[0], label))
+                # Store original - flatten patches into one sequence
+                sequence = patches.flatten()  # ✅ One sequence per image
+                all_patches.append(sequence)
+                all_labels.append(label)  # ✅ One label per image
                 
                 # For training split only: add augmentations
                 if split == "train":
                     for _ in range(self.config.num_aug):
-                        aug_image, _ = dataset[idx]  # Gets new augmentation
+                        aug_image, _ = dataset[idx]
                         aug_patches = self.image_to_patches(aug_image)
-                        all_patches.append(aug_patches)
-                        all_labels.append(np.full(aug_patches.shape[0], label))
+                        aug_sequence = aug_patches.flatten()  # ✅ One sequence per augmented image
+                        all_patches.append(aug_sequence)
+                        all_labels.append(label)  # ✅ One label per augmented image
             
             # Save as numpy arrays
-            inputs = np.concatenate(all_patches, axis=0)
-            labels = np.concatenate(all_labels, axis=0)
+            inputs = np.array(all_patches)
+            labels = np.array(all_labels)
             
             np.save(os.path.join(split_dir, "all__inputs.npy"), inputs)
             np.save(os.path.join(split_dir, "all__labels.npy"), labels)
@@ -117,9 +125,9 @@ class CIFARProcessor:
             seq_len = self.config.patch_size * self.config.patch_size * self.config.num_channels
             metadata = CIFARDatasetMetadata(
                 num_classes=self.get_num_classes(),
-                num_train_examples=len(train_dataset),  # CIFAR standard train set size
-                num_test_examples=len(test_dataset),   # CIFAR standard test set size
-                split=split,               # 'train' or 'test'
+                num_train_examples=len(inputs),  # Now correct since inputs contains sequences, not patches
+                num_test_examples=len(inputs),   # Same here
+                split=split,
                 image_size=self.config.image_size,
                 patch_size=self.config.patch_size,
                 num_channels=self.config.num_channels,
