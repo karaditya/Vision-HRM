@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import List
 import os
 from tqdm import tqdm
 import json
@@ -8,41 +8,104 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 
-from argdantic import ArgParser
 from pydantic import BaseModel
-from common import CIFARDatasetMetadata
+
+import hydra
+from omegaconf import DictConfig
 
 
 
-cli = ArgParser()
-
+# Configuration for data processing
 class DataProcessConfig(BaseModel):
-    dataset_name: str = "CIFAR10"
-    output_dir: str = "data/cifar-processed"
-    seed: int = 42
-    num_aug: int = 4
-    image_size: int = 32
-    patch_size: int = 4
-    num_channels: int = 3
+    dataset_name: str 
+    output_dir: str 
+    
+    seed: int 
+    num_aug: int 
+    image_size: int 
+    patch_size: int 
+    num_channels: int 
 
+
+    crop_padding: int 
+    rotation_degrees: int 
+    translate: List[float]
+    color_jitter_brightness: float
+    color_jitter_contrast: float 
+    color_jitter_saturation: float 
+
+    # Normalization stats
+    mean: List[float] 
+    std: List[float]
+
+
+
+
+# Metadata for CIFAR dataset
+class CIFARDatasetMetadata(BaseModel):
+    """Metadata for CIFAR dataset processing with patch-based vision models."""
+    
+    # Dataset properties
+    num_classes: int
+    num_train_examples: int
+    num_test_examples: int
+    seq_len : int
+    split: str  # 'train' or 'test'
+    
+    # Image properties 
+    image_size: int 
+    patch_size: int 
+    num_channels: int 
+    
+    # Normalization stats
+    mean: List[float] 
+    std: List[float]
+    
+    # Augmentation settings
+    use_augmentation: bool = True
+    crop_padding: int 
+    rotation_degrees: int
+    translate: List[float] 
+    color_jitter_brightness: float 
+    color_jitter_contrast: float 
+    color_jitter_saturation: float 
+    
+    @property
+    def patches_per_image(self) -> int:
+        """Number of patches per image."""
+        return (self.image_size // self.patch_size) ** 2
+    
+    @property
+    def patch_dim(self) -> int:
+        """Dimension of each flattened patch."""
+        return self.patch_size * self.patch_size * self.num_channels
+    
+    @property
+    def total_examples(self) -> int:
+        """Total number of examples in the current split."""
+        return self.num_train_examples if self.split == 'train' else self.num_test_examples
+
+
+
+# Processor class for CIFAR dataset
 class CIFARProcessor:
     def __init__(self, config: DataProcessConfig):
         self.config = config
         self.transform_train = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
+            transforms.RandomCrop(config.image_size, padding=config.crop_padding),
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            transforms.RandomRotation(config.rotation_degrees),
+            transforms.ColorJitter(brightness=config.color_jitter_brightness, contrast=config.color_jitter_contrast),
+            transforms.RandomAffine(degrees=0, translate=(config.translate[0], config.translate[1])),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), 
-                               (0.2023, 0.1994, 0.2010))
+            transforms.Normalize((config.mean[0], config.mean[1], config.mean[2]), 
+                               (config.std[0], config.std[1], config.std[2]))
         ])
         
         self.transform_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), 
-                               (0.2023, 0.1994, 0.2010))
+            transforms.Normalize((config.mean[0], config.mean[1], config.mean[2]), 
+                               (config.std[0], config.std[1], config.std[2]))
         ])
 
     
@@ -53,19 +116,19 @@ class CIFARProcessor:
     
     def image_to_patches(self, image: torch.Tensor) -> np.ndarray:
         """Convert image tensor to patches."""
-        # Denormalize and convert to numpy
-        mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3,1,1).to(image.device)
-        std = torch.tensor([0.2023, 0.1994, 0.2010]).view(3,1,1).to(image.device)
-        image = (image * std + mean) * 255
-        image_np = image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)  # Different variable name
         
         # Convert to patches
-        H, W, C = image_np.shape  # Use the numpy variable
+        C, H, W = image.shape  # Use the numpy variable
         P = self.config.patch_size
-        patches = image_np.reshape(H//P, P, W//P, P, C)  # Use the numpy variable
-        patches = patches.transpose(0, 2, 1, 3, 4)
-        patches = patches.reshape(-1, P*P*C)
-        return patches
+
+        # Reshape to (C, H/P, P, W/P, P)
+        patches = image.view(C, H // P, P, W // P, P)
+        # Transpose to (H/P, W/P, P, P, C)
+        patches = patches.permute(1, 3, 2, 4, 0)
+        # Reshape to (Num_Patches, Patch_Dim) where Patch_Dim = P*P*C
+        patches = patches.reshape(-1, P * P * C)
+
+        return patches.cpu().numpy()
 
     def process_dataset(self):
         np.random.seed(self.config.seed)
@@ -101,18 +164,18 @@ class CIFARProcessor:
                 patches = self.image_to_patches(image)
                 
                 # Store original - flatten patches into one sequence
-                sequence = patches.flatten()  # ✅ One sequence per image
+                sequence = patches.flatten()  # One sequence per image : len = num_patches * P * P * C
                 all_patches.append(sequence)
-                all_labels.append(label)  # ✅ One label per image
+                all_labels.append(label)  # One label per image 
                 
                 # For training split only: add augmentations
                 if split == "train":
                     for _ in range(self.config.num_aug):
                         aug_image, _ = dataset[idx]
                         aug_patches = self.image_to_patches(aug_image)
-                        aug_sequence = aug_patches.flatten()  # ✅ One sequence per augmented image
+                        aug_sequence = aug_patches.flatten()  # One sequence per augmented image
                         all_patches.append(aug_sequence)
-                        all_labels.append(label)  # ✅ One label per augmented image
+                        all_labels.append(label)  # One label per augmented image
             
             # Save as numpy arrays
             inputs = np.array(all_patches)
@@ -123,24 +186,38 @@ class CIFARProcessor:
             
             # Save metadata
             seq_len = self.config.patch_size * self.config.patch_size * self.config.num_channels
+
             metadata = CIFARDatasetMetadata(
                 num_classes=self.get_num_classes(),
-                num_train_examples=len(inputs),  # Now correct since inputs contains sequences, not patches
-                num_test_examples=len(inputs),   # Same here
+                num_train_examples=len(inputs),  
+                num_test_examples=len(inputs),
+                seq_len=seq_len,
                 split=split,
                 image_size=self.config.image_size,
                 patch_size=self.config.patch_size,
                 num_channels=self.config.num_channels,
-                use_augmentation=(split == 'train')
+                use_augmentation=(split == 'train'),
+                crop_padding=self.config.crop_padding,
+                rotation_degrees=self.config.rotation_degrees,
+                translate=self.config.translate,
+                color_jitter_brightness=self.config.color_jitter_brightness,
+                color_jitter_contrast=self.config.color_jitter_contrast,
+                color_jitter_saturation=self.config.color_jitter_saturation,
+                mean=self.config.mean,
+                std=self.config.std
             )
-            
-            with open(os.path.join(split_dir, "dataset.json"), "w") as f:
+
+            with open(os.path.join(split_dir, "dataset_metadata.json"), "w") as f:
                 json.dump(metadata.model_dump(), f)
 
-@cli.command(singleton=True)
-def main(config: DataProcessConfig):
-    processor = CIFARProcessor(config)
+@hydra.main(config_path="../config/data", config_name="cfg_build_cifar", version_base=None)
+def main(hydra_cfg: DictConfig):
+    
+    data_process_config = DataProcessConfig(**hydra_cfg)  # type: ignore
+
+    processor = CIFARProcessor(data_process_config)
     processor.process_dataset()
 
+
 if __name__ == "__main__":
-    cli()
+    main()

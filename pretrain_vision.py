@@ -20,35 +20,51 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from torch.optim import AdamW
-from dataset.common import CIFARDatasetMetadata
+from dataset.build_cifar_dataset import CIFARDatasetMetadata
 from models.hrm.hrm_vision_v1 import HierarchicalReasoningModel_VisionV1, HierarchicalReasoningModel_VisionV1Config
 from models.vision_losses import VisionClassificationLossHead
 
+from dataset.common import PreprocessedCIFARDataset 
+
+
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="allow")
+
     name: str
-    loss_type: Optional[str] = None
 
 class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="allow")
+
     name: str
     loss: LossConfig
 
-class VisionConfig(pydantic.BaseModel):
+class PretrainVisionConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="allow")
+
+    # Architecture config
     arch: ArchConfig
+
+    # Path to dataset
     data_path: str
+
+    # Hyperparams
     global_batch_size: int
     epochs: int
+
     lr: float
     lr_min_ratio: float
     lr_warmup_steps: int
+
     weight_decay: float
     beta1: float
     beta2: float
+
+    # Names
     project_name: Optional[str] = None
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
+
+    # Misc
     seed: int = 0
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = 1
@@ -60,19 +76,23 @@ class TrainState:
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
     carry: Any
+
     step: int
     total_steps: int
 
+# Create dataloader function that loads pre-processed CIFAR images and labels 
 def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: int, world_size: int):
-    with open(os.path.join(data_path, split, "dataset.json"), "r") as f:
-        metadata = CIFARDatasetMetadata(**json.load(f))
-    inputs = np.load(os.path.join(data_path, split, "all__inputs.npy"))
-    labels = np.load(os.path.join(data_path, split, "all__labels.npy"))
+    """
+    Creates a DataLoader using the PreprocessedCIFARDataset.
+    """
+    # The data directory for the specific split
+    split_data_dir = os.path.join(data_path, split)
 
-    dataset = TensorDataset(
-        torch.from_numpy(inputs).float(),
-        torch.from_numpy(labels).long()
-    )
+    # Instantiate our new, efficient dataset class
+    dataset = PreprocessedCIFARDataset(data_dir=split_data_dir)
+    
+    # Get metadata directly from the dataset object
+    metadata = dataset.metadata
 
     sampler: Optional[DistributedSampler] = None
     if world_size > 1:
@@ -91,7 +111,9 @@ def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: 
     )
     return loader, metadata
 
-def create_model(config: VisionConfig, train_metadata: CIFARDatasetMetadata, world_size: int):
+
+
+def create_model(config: PretrainVisionConfig, train_metadata: CIFARDatasetMetadata, world_size: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Extract model configuration from arch
@@ -118,15 +140,11 @@ def create_model(config: VisionConfig, train_metadata: CIFARDatasetMetadata, wor
     if device.type == "cuda" and "DISABLE_COMPILE" not in os.environ:
         model = torch.compile(model, dynamic=False) # type: ignore
 
-    # if world_size > 1 and dist.is_initialized():
-    #     for p in model.parameters():
-    #         dist.broadcast(p.data, src=0)
-
 
     if world_size > 1:
         with torch.no_grad():
             for param in list(model.parameters()) + list(model.buffers()):
-                dist.broadcast(param, src=0)  # Parameters AND buffers!
+                dist.broadcast(param, src=0)  # Broadcast Parameters AND buffers!
 
     optimizers = [AdamW(
         model.parameters(),
@@ -134,6 +152,7 @@ def create_model(config: VisionConfig, train_metadata: CIFARDatasetMetadata, wor
         weight_decay=config.weight_decay,
         betas=(config.beta1, config.beta2)
     )]
+
     print("Using AdamW optimizer")
     return model, optimizers, [config.lr]
 
@@ -146,7 +165,7 @@ def cosine_schedule_with_warmup_lr_lambda(
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
     return max(0.0, min_ratio + (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress)))
 
-def init_train_state(config: VisionConfig, train_metadata: CIFARDatasetMetadata, world_size: int):
+def init_train_state(config: PretrainVisionConfig, train_metadata: CIFARDatasetMetadata, world_size: int):
     total_steps = int(config.epochs * train_metadata.num_train_examples / config.global_batch_size)
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size)
     # Initialize carry
@@ -169,7 +188,7 @@ def detach_carry(carry: Any) -> Any:
     return carry
 
 
-def train_batch(train_state: TrainState, batch: tuple, config: VisionConfig, rank: int, world_size: int):
+def train_batch(train_state: TrainState, batch: tuple, config: PretrainVisionConfig, rank: int, world_size: int):
     train_state.step += 1
     if train_state.step > train_state.total_steps:
         return
@@ -243,7 +262,7 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
     if rank == 0:
         return {f"test/{k}": v.item() for k, v in zip(keys, vals)}
 
-def save_train_state(config: VisionConfig, train_state: TrainState):
+def save_train_state(config: PretrainVisionConfig, train_state: TrainState):
     if config.checkpoint_path:
         os.makedirs(config.checkpoint_path, exist_ok=True)
         checkpoint_file = os.path.join(config.checkpoint_path, f"{config.run_name}_step_{train_state.step}.pt")
@@ -260,7 +279,7 @@ def main(hydra_config: DictConfig):
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    config = VisionConfig(**OmegaConf.to_container(hydra_config, resolve=True)) # type: ignore
+    config = PretrainVisionConfig(**OmegaConf.to_container(hydra_config, resolve=True)) # type: ignore
     if config.run_name is None:
         config.run_name = f"{config.arch.name.split('.')[-1]}-{coolname.generate_slug(2)}"
     if config.checkpoint_path is None:
