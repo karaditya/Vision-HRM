@@ -55,12 +55,18 @@ class VisionPatchEmbedding(nn.Module):
         patch_dim = config.patch_size * config.patch_size * 3  # RGB channels
         self.patch_embed = CastedLinear(patch_dim, config.hidden_size, bias=True)
         
-        # Positional embedding for patches
-        num_patches = (config.image_size // config.patch_size) ** 2
-        self.pos_embed = CastedEmbedding(
-            num_patches,
-            config.hidden_size,
-            init_std=0.02,
+        # 2D positional embedding instead of 1D
+        grid_size = config.image_size // config.patch_size  # 8x8 for 32/4
+        self.pos_embed_h = CastedEmbedding(
+            grid_size, 
+            config.hidden_size // 2, 
+            init_std=0.02, 
+            cast_to=getattr(torch, config.forward_dtype)
+        )
+        self.pos_embed_w = CastedEmbedding(
+            grid_size, 
+            config.hidden_size // 2, 
+            init_std=0.02, 
             cast_to=getattr(torch, config.forward_dtype)
         )
         
@@ -74,6 +80,7 @@ class VisionPatchEmbedding(nn.Module):
         # Reshape to patches
         patch_dim = self.config.patch_size * self.config.patch_size * 3
         num_patches = (self.config.image_size // self.config.patch_size) ** 2
+        grid_size = self.config.image_size // self.config.patch_size
         
         # Truncate or pad to exact patch size
         if x.shape[1] > num_patches * patch_dim:
@@ -92,9 +99,15 @@ class VisionPatchEmbedding(nn.Module):
         # Project patches to embeddings
         x = self.patch_embed(x)
         
-        # Add positional embeddings
-        pos_ids = torch.arange(num_patches, device=x.device).unsqueeze(0)
-        x = x + self.pos_embed(pos_ids)
+        # 2D positional encoding
+        h_pos = torch.arange(grid_size, device=x.device).repeat(grid_size, 1).flatten()  # [0,1,2,3,4,5,6,7,0,1,2,...]
+        w_pos = torch.arange(grid_size, device=x.device).repeat_interleave(grid_size)    # [0,0,0,0,0,0,0,0,1,1,1,...]
+        
+        pos_h = self.pos_embed_h(h_pos).unsqueeze(0)  # (1, num_patches, hidden_size//2)
+        pos_w = self.pos_embed_w(w_pos).unsqueeze(0)  # (1, num_patches, hidden_size//2)
+        pos_embed = torch.cat([pos_h, pos_w], dim=-1)  # (1, num_patches, hidden_size)
+        
+        x = x + pos_embed
         
         # Add class token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
@@ -125,10 +138,9 @@ class VisionClassificationHead(nn.Module):
         
         return logits
 
+    
 
 class HierarchicalReasoningModel_VisionV1Block(nn.Module):
-    """Single block for vision HRM."""
-    
     def __init__(self, config: HierarchicalReasoningModel_VisionV1Config):
         super().__init__()
         self.config = config
@@ -147,23 +159,25 @@ class HierarchicalReasoningModel_VisionV1Block(nn.Module):
             hidden_size=config.hidden_size,
             expansion=config.expansion
         )
-        
+
         # Layer norms
         self.attn_norm = nn.LayerNorm(config.hidden_size)
         self.mlp_norm = nn.LayerNorm(config.hidden_size)
         
+        # Add dropout
+        self.dropout = nn.Dropout(0.1)
+        
     def forward(self, x: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
-        # Self-attention
         residual = x
         x = self.attn_norm(x)
-        # Vision encoder uses full attention without mask; pass no RoPE here (applied internally in Attention)
         x = self.attention(None, x)
+        x = self.dropout(x)  # Add dropout
         x = residual + x
         
-        # MLP
         residual = x
         x = self.mlp_norm(x)
         x = self.mlp(x)
+        x = self.dropout(x)  # Add dropout
         x = residual + x
         
         return x

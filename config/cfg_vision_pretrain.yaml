@@ -8,7 +8,7 @@ defaults:
 data_path: data/cifar-processed
 
 # Hyperparameters
-global_batch_size: 32
+global_batch_size: 64
 epochs: 100
 lr: 1e-4
 lr_min_ratio: 0.1
@@ -26,5 +26,5 @@ checkpoint_path: null
 # Extras
 seed: 42
 checkpoint_every_eval: true
-eval_interval: 10
+eval_interval: 1
 eval_save_outputs: ["logits", "predictions"]
