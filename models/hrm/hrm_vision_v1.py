@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from models.layers import Attention, SwiGLU, RotaryEmbedding, CastedEmbedding, CastedLinear
-from models.sparse_embedding import CastedSparseEmbedding, CastedSparseEmbeddingSignSGD_Distributed
 
 
 @dataclass
@@ -25,8 +24,6 @@ class HierarchicalReasoningModel_VisionV1Config:
     L_cycles: int
     
     # Vision-specific
-    vocab_size: int
-    seq_len: int
     num_classes: int
     patch_size: int
     image_size: int

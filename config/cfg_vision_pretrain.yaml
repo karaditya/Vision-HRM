@@ -1,7 +1,7 @@
 
 # Vision training configuration
 defaults:
-  - _self_  # Add _self_ to fix Hydra warning
+  - _self_  
   - arch: hrm_vision_v1
 
 # Data

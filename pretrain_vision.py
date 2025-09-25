@@ -21,10 +21,13 @@ from tqdm import tqdm
 
 from torch.optim import AdamW
 from dataset.build_cifar_dataset import CIFARDatasetMetadata
-from models.hrm.hrm_vision_v1 import HierarchicalReasoningModel_VisionV1, HierarchicalReasoningModel_VisionV1Config
-from models.vision_losses import VisionClassificationLossHead
+from utils.functions import load_model_class, get_model_source_path
+
 
 from dataset.common import PreprocessedCIFARDataset 
+
+
+
 
 
 class LossConfig(pydantic.BaseModel):
@@ -67,7 +70,7 @@ class PretrainVisionConfig(pydantic.BaseModel):
     # Misc
     seed: int = 0
     checkpoint_every_eval: bool = False
-    eval_interval: Optional[int] = 1
+    eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
 
 @dataclass
@@ -79,6 +82,11 @@ class TrainState:
 
     step: int
     total_steps: int
+
+
+
+
+
 
 # Create dataloader function that loads pre-processed CIFAR images and labels 
 def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: int, world_size: int):
@@ -113,39 +121,35 @@ def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: 
 
 
 
+# Create model function
 def create_model(config: PretrainVisionConfig, train_metadata: CIFARDatasetMetadata, world_size: int):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Extract model configuration from arch
-    model_cfg_dict = dict(config.arch.model_extra or {})
-    model_cfg_dict.update(
+    model_cfg = dict(config.arch.model_extra , # type: ignore
+                     
         batch_size=config.global_batch_size // world_size,
+
         image_size=train_metadata.image_size,
         patch_size=train_metadata.patch_size,
         num_classes=train_metadata.num_classes
     )
 
-    # Debug: Print configuration
-    print(f"Config arch: {config.arch}")
-    print(f"Model configuration: {model_cfg_dict}")
+    # Instantiate model with loss head
+    model_cls = load_model_class(config.arch.name)
+    loss_head_cls = load_model_class(config.arch.loss.name)
 
-    # Create model directly with the configuration dictionary
-    model: nn.Module = HierarchicalReasoningModel_VisionV1(model_cfg_dict)
-    
-    # Instantiate loss head
-    loss_head_config = dict(config.arch.loss.model_extra or {})
-    model = VisionClassificationLossHead(model, **loss_head_config)
-    model.to(device)
+    with torch.device(device):
+        model: nn.Module = model_cls(model_cfg)
+        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        if "DISABLE_COMPILE" not in os.environ:
+            model = torch.compile(model, dynamic=False)  # type: ignore
 
-    if device.type == "cuda" and "DISABLE_COMPILE" not in os.environ:
-        model = torch.compile(model, dynamic=False) # type: ignore
-
-
-    if world_size > 1:
-        with torch.no_grad():
-            for param in list(model.parameters()) + list(model.buffers()):
-                dist.broadcast(param, src=0)  # Broadcast Parameters AND buffers!
-
+        # Broadcast parameters from rank 0
+        if world_size > 1:
+            with torch.no_grad():
+                for param in list(model.parameters()) + list(model.buffers()):
+                    dist.broadcast(param, src=0)
     optimizers = [AdamW(
         model.parameters(),
         lr=config.lr,

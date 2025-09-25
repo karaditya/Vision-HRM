@@ -7,9 +7,6 @@ loss:
 num_classes: 10  # CIFAR-10 (change to 100 for CIFAR-100)
 patch_size: 4
 image_size: 32
-vocab_size: 1000  # Default for patch embeddings
-seq_len: 192      # (32 // 4) ** 2 * (4 * 4 * 3) = 16 * 12
-
 
 # ACT parameters
 halt_exploration_prob: 0.0  # No exploration for vision
