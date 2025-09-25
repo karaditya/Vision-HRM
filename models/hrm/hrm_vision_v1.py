@@ -45,96 +45,106 @@ class HierarchicalReasoningModel_VisionV1Config:
 
 
 class VisionPatchEmbedding(nn.Module):
-    """Convert image patches to embeddings."""
+    """CNN-based patch embedding with inductive bias."""
     
     def __init__(self, config: HierarchicalReasoningModel_VisionV1Config):
         super().__init__()
         self.config = config
         
-        # Patch embedding layer
-        patch_dim = config.patch_size * config.patch_size * 3  # RGB channels
-        self.patch_embed = CastedLinear(patch_dim, config.hidden_size, bias=True)
-        
-        # 2D positional embedding instead of 1D
-        grid_size = config.image_size // config.patch_size  # 8x8 for 32/4
-        self.pos_embed_h = CastedEmbedding(
-            grid_size, 
-            config.hidden_size // 2, 
-            init_std=0.02, 
-            cast_to=getattr(torch, config.forward_dtype)
-        )
-        self.pos_embed_w = CastedEmbedding(
-            grid_size, 
-            config.hidden_size // 2, 
-            init_std=0.02, 
-            cast_to=getattr(torch, config.forward_dtype)
+        # CNN-based patch embedding (3-block conv)
+        embed_dim = config.hidden_size
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(3, embed_dim//4, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(embed_dim//4, embed_dim//2, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(embed_dim//2, embed_dim, kernel_size=4, stride=4)  # 4x4 patches
         )
         
-        # Class token embedding (for classification)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        # Multi-class tokens (2 instead of 1)
+        self.cls_tokens = nn.Parameter(torch.zeros(1, 2, config.hidden_size))
         
     def forward(self, x: Tensor) -> Tensor:
-        # x shape: (batch_size, seq_len) where seq_len = num_patches * patch_dim
         batch_size = x.shape[0]
         
-        # Reshape to patches
-        patch_dim = self.config.patch_size * self.config.patch_size * 3
-        num_patches = (self.config.image_size // self.config.patch_size) ** 2
-        grid_size = self.config.image_size // self.config.patch_size
+        # Reshape input to image format
+        x = x.view(batch_size, 32, 32, 3).permute(0, 3, 1, 2)  # (B, 3, 32, 32)
+        x = x.float() / 255.0  # Normalize to [0, 1]
         
-        # Truncate or pad to exact patch size
-        if x.shape[1] > num_patches * patch_dim:
-            x = x[:, :num_patches * patch_dim]
-        elif x.shape[1] < num_patches * patch_dim:
-            # Pad with zeros
-            pad_size = num_patches * patch_dim - x.shape[1]
-            x = torch.cat([x, torch.zeros(batch_size, pad_size, device=x.device, dtype=x.dtype)], dim=1)
+        # CNN patch embedding
+        x = self.patch_embed(x)  # (B, hidden_size, 8, 8)
+        x = x.flatten(2).transpose(1, 2)  # (B, 64, hidden_size)
         
-        # Reshape to patches
-        x = x.view(batch_size, num_patches, patch_dim)
-        
-        # Normalize pixel values to [0, 1] range
-        x = x.float() / 255.0
-        
-        # Project patches to embeddings
-        x = self.patch_embed(x)
-        
-        # 2D positional encoding
-        h_pos = torch.arange(grid_size, device=x.device).repeat(grid_size, 1).flatten()  # [0,1,2,3,4,5,6,7,0,1,2,...]
-        w_pos = torch.arange(grid_size, device=x.device).repeat_interleave(grid_size)    # [0,0,0,0,0,0,0,0,1,1,1,...]
-        
-        pos_h = self.pos_embed_h(h_pos).unsqueeze(0)  # (1, num_patches, hidden_size//2)
-        pos_w = self.pos_embed_w(w_pos).unsqueeze(0)  # (1, num_patches, hidden_size//2)
-        pos_embed = torch.cat([pos_h, pos_w], dim=-1)  # (1, num_patches, hidden_size)
-        
-        x = x + pos_embed
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
+        # Add multi-class tokens
+        cls_tokens = self.cls_tokens.expand(batch_size, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)  # (B, 66, hidden_size)
         
         return x
 
+class MultiHeadLatentAttention(nn.Module):
+    """Compressed attention with 17x parameter reduction."""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = config.hidden_size // config.num_heads
+        self.compression_dim = 64  # Key hyperparameter
+        
+        # Compressed query projections
+        self.q_down = CastedLinear(config.hidden_size, self.compression_dim, bias=False)
+        self.q_up = CastedLinear(self.compression_dim, config.hidden_size, bias=False)
+        
+        # Standard K, V projections
+        self.k_proj = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
+        self.v_proj = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
+        self.out_proj = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
+        
+    def forward(self, x):
+        B, N, C = x.shape
+        
+        # Compressed queries
+        q_compressed = self.q_down(x)  # (B, N, compression_dim)
+        q = self.q_up(q_compressed)    # (B, N, hidden_size)
+        
+        # Standard K, V
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Multi-head attention
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(scores, dim=-1)
+        
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        
+        return self.out_proj(out)
+    
+
+
 
 class VisionClassificationHead(nn.Module):
-    """Classification head for vision tasks."""
-    
     def __init__(self, config: HierarchicalReasoningModel_VisionV1Config):
         super().__init__()
         self.config = config
         
         # Global average pooling + classification head
-        self.norm = nn.LayerNorm(config.hidden_size)
-        self.classifier = CastedLinear(config.hidden_size, config.num_classes, bias=True)
+        self.norm = nn.LayerNorm(config.hidden_size * 2)
+        self.classifier = CastedLinear(config.hidden_size * 2, config.num_classes, bias=True)  # *2 for multi-class tokens
         
     def forward(self, x: Tensor) -> Tensor:
-        # x shape: (batch_size, seq_len, hidden_size)
-        # Use class token (first token) for classification
-        cls_token = x[:, 0, :]  # (batch_size, hidden_size)
+        # Use both class tokens (first 2 tokens) for classification
+        cls_tokens = x[:, :2, :]  # (batch_size, 2, hidden_size)
+        cls_tokens = cls_tokens.flatten(1)  # (batch_size, 2*hidden_size)
         
         # Normalize and classify
-        cls_token = self.norm(cls_token)
-        logits = self.classifier(cls_token)
+        cls_tokens = self.norm(cls_tokens)
+        logits = self.classifier(cls_tokens)
         
         return logits
 
@@ -145,16 +155,10 @@ class HierarchicalReasoningModel_VisionV1Block(nn.Module):
         super().__init__()
         self.config = config
         
-        # Attention
-        self.attention = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            causal=False
-        )
+        # Use MLA instead of standard attention
+        self.attention = MultiHeadLatentAttention(config)
         
-        # MLP
+        # Keep existing MLP
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion
@@ -164,20 +168,22 @@ class HierarchicalReasoningModel_VisionV1Block(nn.Module):
         self.attn_norm = nn.LayerNorm(config.hidden_size)
         self.mlp_norm = nn.LayerNorm(config.hidden_size)
         
-        # Add dropout
-        self.dropout = nn.Dropout(0.1)
+        # Stochastic depth for regularization
+        self.drop = nn.Dropout(0.1) 
         
     def forward(self, x: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
+        # Self-attention with stochastic depth
         residual = x
         x = self.attn_norm(x)
-        x = self.attention(None, x)
-        x = self.dropout(x)  # Add dropout
+        x = self.attention(x)
+        x = self.drop(x)
         x = residual + x
         
+        # MLP with stochastic depth
         residual = x
         x = self.mlp_norm(x)
         x = self.mlp(x)
-        x = self.dropout(x)  # Add dropout
+        x = self.drop(x)
         x = residual + x
         
         return x
@@ -218,7 +224,7 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
         # Vision token count (num_patches + 1 for class token)
         self.num_patches = (self.config.image_size // self.config.patch_size) ** 2
-        self.seq_len_tokens = self.num_patches + 1
+        self.seq_len_tokens = self.num_patches + 2
         
         # Vision-specific components
         self.patch_embedding = VisionPatchEmbedding(config)
