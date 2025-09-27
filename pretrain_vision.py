@@ -20,6 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from torch.optim import AdamW
+from adam_atan2 import AdamATan2 # type: ignore
 from dataset.build_cifar_dataset import CIFARDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 
@@ -150,15 +151,54 @@ def create_model(config: PretrainVisionConfig, train_metadata: CIFARDatasetMetad
             with torch.no_grad():
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
-    optimizers = [AdamW(
-        model.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-        betas=(config.beta1, config.beta2)
-    )]
 
-    print("Using AdamW optimizer")
-    return model, optimizers, [config.lr]
+
+    # Optimizers - Try AdamATan2, fallback to AdamW if CUDA fails
+    optimizers = []
+    use_adamw = os.environ.get("FORCE_ADAMW", "false").lower() == "true"
+    
+    if device == "cuda" and not use_adamw:
+        try:
+            print("Attempting to create AdamATan2 optimizer...")
+            # Create a dummy optimizer to test if CUDA kernels work
+            dummy_param = nn.Parameter(torch.randn(1, device=device))
+            test_optimizer = AdamATan2([dummy_param], lr=1e-3)
+            dummy_param.grad = torch.zeros_like(dummy_param)
+            test_optimizer.step()  # This will fail if CUDA kernels don't work
+            
+            # If we get here, it works
+            optimizers = [
+                AdamATan2(
+                    model.parameters(),
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            ]
+            print("Successfully created AdamATan2 optimizer")
+            
+        except Exception as e:
+            print(f"AdamATan2 failed with error: {type(e).__name__}: {e}")
+            print("Falling back to AdamW optimizer")
+            use_adamw = True
+    else:
+        use_adamw = True
+        
+    if use_adamw:
+        optimizers = [
+            AdamW(
+                model.parameters(),
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2)
+            )
+        ]
+        print("Using AdamW optimizer")
+    
+    optimizer_lrs = [
+        config.lr
+    ]
+    return model, optimizers, optimizer_lrs
 
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int,
@@ -167,30 +207,31 @@ def cosine_schedule_with_warmup_lr_lambda(
     if current_step < num_warmup_steps:
         return float(current_step) / float(max(1, num_warmup_steps))
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    return max(0.0, min_ratio + (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress)))
+    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 def init_train_state(config: PretrainVisionConfig, train_metadata: CIFARDatasetMetadata, world_size: int):
+    
     total_steps = int(config.epochs * train_metadata.num_train_examples / config.global_batch_size)
+    
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size)
-    # Initialize carry
-    batch_size = config.global_batch_size // world_size
-    dummy_batch = {
-        "inputs": torch.zeros((batch_size, train_metadata.patches_per_image * train_metadata.patch_dim)),
-        "labels": torch.zeros((batch_size,), dtype=torch.long)
-    }
-    carry = model.initial_carry(dummy_batch) # type: ignore
-    return TrainState(step=0, total_steps=total_steps, model=model, optimizers=optimizers, optimizer_lrs=optimizer_lrs, carry=carry)
+    
 
-def detach_carry(carry: Any) -> Any:
-    """Detach tensors in carry to prevent gradient tracking."""
-    if isinstance(carry, torch.Tensor):
-        return carry.detach()
-    elif isinstance(carry, (list, tuple)):
-        return type(carry)(detach_carry(x) for x in carry)
-    elif isinstance(carry, dict):
-        return {k: detach_carry(v) for k, v in carry.items()}
-    return carry
+    return TrainState(
+        step=0, 
+        total_steps=total_steps, 
+        
+        model=model, 
+        optimizers=optimizers, 
+        optimizer_lrs=optimizer_lrs, 
+        carry=None
+    )
 
+
+def save_train_state(config: PretrainVisionConfig, train_state: TrainState):
+    if config.checkpoint_path:
+        os.makedirs(config.checkpoint_path, exist_ok=True)
+        checkpoint_file = os.path.join(config.checkpoint_path, f"{config.run_name}_step_{train_state.step}.pt")
+        torch.save(train_state.model.state_dict(), checkpoint_file)
 
 def train_batch(train_state: TrainState, batch: tuple, config: PretrainVisionConfig, rank: int, world_size: int):
     train_state.step += 1
@@ -201,8 +242,11 @@ def train_batch(train_state: TrainState, batch: tuple, config: PretrainVisionCon
     inputs, labels = batch
     batch_dict = {"inputs": inputs.to(model_device), "labels": labels.to(model_device)}
 
-    # Reinitialize carry every batch to avoid backprop-through-graph across steps
-    train_state.carry = train_state.model.initial_carry(batch_dict)  # type: ignore
+    # Init carry if it is None
+    if train_state.carry is None:
+        with torch.device("cuda"):
+            train_state.carry = train_state.model.initial_carry(batch_dict)  # type: ignore
+
 
     train_state.carry, loss, metrics, _, _ = train_state.model(
         carry=train_state.carry,
@@ -221,12 +265,13 @@ def train_batch(train_state: TrainState, batch: tuple, config: PretrainVisionCon
 
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = base_lr * cosine_schedule_with_warmup_lr_lambda(
+        lr_this_step = cosine_schedule_with_warmup_lr_lambda(
             current_step=train_state.step, base_lr=base_lr, num_warmup_steps=config.lr_warmup_steps,
             num_training_steps=train_state.total_steps, min_ratio=config.lr_min_ratio
         )
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
+
         optim.step()
         optim.zero_grad()
 
@@ -266,11 +311,7 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
     if rank == 0:
         return {f"test/{k}": v.item() for k, v in zip(keys, vals)}
 
-def save_train_state(config: PretrainVisionConfig, train_state: TrainState):
-    if config.checkpoint_path:
-        os.makedirs(config.checkpoint_path, exist_ok=True)
-        checkpoint_file = os.path.join(config.checkpoint_path, f"{config.run_name}_step_{train_state.step}.pt")
-        torch.save(train_state.model.state_dict(), checkpoint_file)
+
 
 @hydra.main(config_path="config", config_name="cfg_vision_pretrain", version_base=None)
 def main(hydra_config: DictConfig):
@@ -312,12 +353,14 @@ def main(hydra_config: DictConfig):
         for batch in pbar:
             metrics = train_batch(train_state, batch, config, RANK, WORLD_SIZE)
             if RANK == 0 and metrics:
+                metrics["epoch"] = epoch + 1
                 pbar.set_postfix({k.split('/')[-1]: f"{v:.3f}" for k, v in metrics.items()})
                 wandb.log(metrics, step=train_state.step)
 
         if (epoch + 1) % (config.eval_interval or 1) == 0:
             eval_metrics = evaluate(train_state, eval_loader, RANK, WORLD_SIZE)
             if RANK == 0 and eval_metrics:
+                eval_metrics["epoch"] = epoch + 1
                 print("Evaluation metrics:", {k: f"{v:.4f}" for k, v in eval_metrics.items()})
                 wandb.log(eval_metrics, step=train_state.step)
                 if config.checkpoint_every_eval:

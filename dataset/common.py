@@ -57,7 +57,7 @@ class PreprocessedCIFARDataset(Dataset):
             A tuple containing the input tensor and the label tensor.
         """
         # Slicing a memory-mapped array loads only the requested data into memory
-        input_data = torch.from_numpy(self.inputs[idx]).float()
+        input_data = torch.from_numpy(self.inputs[idx].copy()).float()
         label_data = torch.tensor(self.labels[idx], dtype=torch.long)
         
         return input_data, label_data

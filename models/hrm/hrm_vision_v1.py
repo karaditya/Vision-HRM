@@ -282,18 +282,33 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
             input_embeds = input_embeds + self.embed_pos(pos_ids)
         
         # Hierarchical reasoning
-        for _ in range(self.config.H_cycles):
-            # High-level reasoning
-            carry.H_hidden = self.H_level(carry.H_hidden, input_embeds)
+        
+        with torch.no_grad():
+            z_H, z_L = carry.H_hidden, carry.L_hidden
             
-            # Low-level reasoning
-            for _ in range(self.config.L_cycles):
-                carry.L_hidden = self.L_level(carry.L_hidden, self.H_proj(carry.H_hidden))
+            for h_step in range(self.config.H_cycles):
+                # High-level reasoning
+                if not (h_step == self.config.H_cycles - 1):  # Skip last iteration
+                    z_H = self.H_level(z_H, input_embeds)
+                
+                # Low-level reasoning
+                for l_step in range(self.config.L_cycles):
+                    if not ((h_step == self.config.H_cycles - 1) and (l_step == self.config.L_cycles - 1)):  # Skip last iteration
+                        z_L = self.L_level(z_L, self.H_proj(z_H))
+        
+        # Ensure no gradients from previous iterations
+        assert not z_H.requires_grad and not z_L.requires_grad
+        
+        # Final iteration WITH gradients (1-step grad)
+        z_H = self.H_level(z_H, input_embeds)
+        z_L = self.L_level(z_L, self.H_proj(z_H))
         
         # Classification
-        logits = self.classification_head(carry.L_hidden)
+        logits = self.classification_head(z_L)
         
-        # Update step
+        # Update carry without gradients for next iteration
+        carry.H_hidden = z_H.detach()
+        carry.L_hidden = z_L.detach()
         carry.step += 1
         
         return carry, logits, torch.tensor(0.0, device=logits.device)  # Dummy halt probability
