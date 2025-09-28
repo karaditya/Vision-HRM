@@ -9,8 +9,8 @@ patch_size: 4
 image_size: 32
 
 # ACT parameters
-halt_exploration_prob: 0.0  # No exploration for vision
-halt_max_steps: 1          # Single forward pass
+halt_exploration_prob: 0.1  # No exploration for vision
+halt_max_steps: 20          # Single forward pass
 
 # Architecture
 H_cycles: 2
