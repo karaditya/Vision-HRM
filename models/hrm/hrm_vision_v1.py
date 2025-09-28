@@ -283,26 +283,24 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         
         # Hierarchical reasoning
         
+        # Forward iterations
         with torch.no_grad():
             z_H, z_L = carry.H_hidden, carry.L_hidden
-            
-            for h_step in range(self.config.H_cycles):
-                # High-level reasoning
-                if not (h_step == self.config.H_cycles - 1):  # Skip last iteration
-                    z_H = self.H_level(z_H, input_embeds)
-                
-                # Low-level reasoning
-                for l_step in range(self.config.L_cycles):
-                    if not ((h_step == self.config.H_cycles - 1) and (l_step == self.config.L_cycles - 1)):  # Skip last iteration
-                        z_L = self.L_level(z_L, self.H_proj(z_H))
-        
-        # Ensure no gradients from previous iterations
+
+            for _H_step in range(self.config.H_cycles):
+                for _L_step in range(self.config.L_cycles):
+                    if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
+                        z_L = self.L_level(z_L, z_H + input_embeds)
+
+                if not (_H_step == self.config.H_cycles - 1):
+                    z_H = self.H_level(z_H, z_L)
+
         assert not z_H.requires_grad and not z_L.requires_grad
-        
-        # Final iteration WITH gradients (1-step grad)
-        z_H = self.H_level(z_H, input_embeds)
-        z_L = self.L_level(z_L, self.H_proj(z_H))
-        
+
+        # 1-step grad
+        z_L = self.L_level(z_L, z_H + input_embeds)
+        z_H = self.H_level(z_H, z_L)
+
         # Classification
         logits = self.classification_head(z_L)
         
