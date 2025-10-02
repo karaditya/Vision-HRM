@@ -300,14 +300,14 @@ def train_batch(train_state: TrainState, batch: Tuple[Tensor, Tensor], config: P
 def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_size: int):
     train_state.model.eval()
     all_metrics = []
-    keys = ["count", "accuracy", "steps", "lm_loss", "q_halt_loss", "q_continue_loss"]
-
+    keys = None
+    
     with torch.inference_mode():
         for batch in eval_loader:
             model_device = next(train_state.model.parameters()).device
             inputs, labels = batch
             batch_dict = {"inputs": inputs.to(model_device), "labels": labels.to(model_device)}
-            carry = train_state.model.initial_carry(batch_dict)  # type: ignore
+            carry = train_state.model.initial_carry(batch_dict) # type: ignore
             step_metrics_list = []
             
             while not carry.halted.all():
@@ -316,14 +316,12 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
             
             # Aggregate metrics across steps for this batch
             if step_metrics_list:
-                keys = sorted(step_metrics_list[0].keys())
+                if keys is None:
+                    keys = sorted(step_metrics_list[0].keys())
                 vals = torch.stack([torch.stack([m[k] for m in step_metrics_list]).sum(dim=0) for k in keys])
-            else:
-                vals = torch.zeros(len(keys), device=model_device)
-            
-            all_metrics.append(vals)
+                all_metrics.append(vals)
 
-    if not all_metrics:
+    if not all_metrics or keys is None:
         return {}
 
     # Sum across all batches
@@ -335,7 +333,7 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
 
     # Only rank 0 computes and returns metrics
     if rank == 0:
-        total_count = vals[keys.index("count")].item() 
+        total_count = vals[keys.index("count")].item()
         if total_count == 0:
             return {}
         
