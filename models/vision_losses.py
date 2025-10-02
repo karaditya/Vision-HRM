@@ -4,9 +4,6 @@ import torch.nn.functional as F
 from typing import Dict, Any, Tuple, Optional
 
 
-IGNORE_LABEL_ID = -100
-
-
 class VisionClassificationLossHead(nn.Module):
     """Loss head for vision classification tasks with deep supervision."""
     
@@ -25,13 +22,10 @@ class VisionClassificationLossHead(nn.Module):
         with torch.no_grad():
             is_correct = (torch.argmax(outputs["logits"], dim=-1) == labels.long())
             valid_metrics = new_carry.halted
-            total_valid = valid_metrics.sum().float().item()  # Compute total_valid as a scalar
-            accuracy = torch.where(valid_metrics, is_correct.float(), 0).sum() / total_valid if total_valid > 0 else torch.tensor(0.0, device=lm_loss.device)
-            exact_accuracy = (valid_metrics & is_correct).sum().float() / total_valid if total_valid > 0 else torch.tensor(0.0, device=lm_loss.device)
+            accuracy = torch.where(valid_metrics, is_correct.float(), 0).sum() 
             metrics = {
                 "count": valid_metrics.sum().float(),
                 "accuracy": accuracy,
-                "exact_accuracy": exact_accuracy,
                 "steps": torch.where(valid_metrics, new_carry.steps.float(), 0).sum(),
             }
             q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], is_correct.float(), reduction="sum")

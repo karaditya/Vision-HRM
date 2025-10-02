@@ -6,6 +6,10 @@ import json
 import numpy as np
 
 import torch
+
+torch.set_float32_matmul_precision('high')
+torch._dynamo.config.capture_scalar_outputs = True
+
 import torch.distributed as dist
 from torch import nn, Tensor
 from torch.utils.data import DataLoader, TensorDataset
@@ -288,7 +292,7 @@ def train_batch(train_state: TrainState, batch: Tuple[Tensor, Tensor], config: P
                 vals.append(torch.tensor([float(v) for v in values], device=model_device).sum())
         vals = torch.stack(vals)
         total_count = vals[keys.index("count")].item() if "count" in keys else 1.0
-        out = {f"train/{k}": (v.item() / total_count if k in ["accuracy", "exact_accuracy"] else v.item()) for k, v in zip(keys, vals)}
+        out = {f"train/{k}": (v.item() / total_count if k == "accuracy" else v.item()) for k, v in zip(keys, vals)}
         out["train/lr"] = lr_this_step # type: ignore
         return out
     return None
@@ -296,39 +300,52 @@ def train_batch(train_state: TrainState, batch: Tuple[Tensor, Tensor], config: P
 def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_size: int):
     train_state.model.eval()
     all_metrics = []
+    keys = ["count", "accuracy", "steps", "lm_loss", "q_halt_loss", "q_continue_loss"]
+
     with torch.inference_mode():
         for batch in eval_loader:
             model_device = next(train_state.model.parameters()).device
             inputs, labels = batch
             batch_dict = {"inputs": inputs.to(model_device), "labels": labels.to(model_device)}
             carry = train_state.model.initial_carry(batch_dict)  # type: ignore
-            halted = carry.halted
             step_metrics_list = []
-            while not halted.all():
-                carry, _, step_metrics, _, halted = train_state.model(carry=carry, batch=batch_dict, return_keys=[])
+            
+            while not carry.halted.all():
+                carry, _, step_metrics, _, _ = train_state.model(carry=carry, batch=batch_dict, return_keys=[])
                 step_metrics_list.append(step_metrics)
-            # Aggregate metrics, handle empty case and non-tensor values
+            
+            # Aggregate metrics across steps for this batch
             if step_metrics_list:
                 keys = sorted(step_metrics_list[0].keys())
-                vals = []
-                for k in keys:
-                    values = [m[k] for m in step_metrics_list]
-                    if all(isinstance(v, torch.Tensor) for v in values):
-                        vals.append(torch.stack(values).sum(dim=0))
-                    else:
-                        vals.append(torch.tensor([float(v) for v in values], device=model_device).sum())
-                vals = torch.stack(vals)
+                vals = torch.stack([torch.stack([m[k] for m in step_metrics_list]).sum(dim=0) for k in keys])
             else:
-                keys = ["count", "accuracy", "exact_accuracy", "steps", "lm_loss", "q_halt_loss", "q_continue_loss"]
                 vals = torch.zeros(len(keys), device=model_device)
+            
             all_metrics.append(vals)
 
     if not all_metrics:
         return {}
 
+    # Sum across all batches
     vals = torch.stack(all_metrics).sum(dim=0)
+    
+    # All-reduce across GPUs
     if world_size > 1 and dist.is_initialized():
         dist.all_reduce(vals)
+
+    # Only rank 0 computes and returns metrics
+    if rank == 0:
+        total_count = vals[keys.index("count")].item() 
+        if total_count == 0:
+            return {}
+        
+        eval_metrics = {
+            f"eval/{k}": (v.item() / total_count if k == "accuracy" else v.item()) 
+            for k, v in zip(keys, vals)
+        }
+        return eval_metrics
+
+    return {}
 
 
 
