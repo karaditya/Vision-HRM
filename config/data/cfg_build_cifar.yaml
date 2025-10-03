@@ -1,0 +1,35 @@
+# Configuration for building the CIFAR dataset
+
+# --- Defaults ---
+defaults:
+  - _self_
+
+# --- Main Config ---
+dataset_name: "CIFAR10"
+output_dir: "data/${dataset_name}-processed" # Directory to save processed dataset
+
+seed: 42
+num_aug: 4
+image_size: 32
+patch_size: 4
+num_channels: 3
+
+crop_padding: 4
+rotation_degrees: 15
+translate:
+  - 0.1
+  - 0.1
+color_jitter_brightness: 0.2
+color_jitter_contrast: 0.2
+color_jitter_saturation: 0.2
+
+# Normalization stats
+mean:
+  - 0.4914
+  - 0.4822
+  - 0.4465
+
+std:
+  - 0.2023
+  - 0.1994
+  - 0.2010
