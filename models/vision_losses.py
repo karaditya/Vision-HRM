@@ -13,7 +13,7 @@ class VisionClassificationLossHead(nn.Module):
         self.loss_type = loss_type
         
     def forward(self, carry: Any, batch: Dict[str, torch.Tensor], return_keys: Any = None) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], bool]:
-        new_carry, outputs = self.model(carry, batch, return_keys)
+        new_carry, outputs = self.model(carry, batch)
         labels = new_carry.current_data["labels"]
         if labels.dim() > 1:
             labels = labels[:, 0]  # Assume scalar labels
@@ -22,6 +22,7 @@ class VisionClassificationLossHead(nn.Module):
         with torch.no_grad():
             is_correct = (torch.argmax(outputs["logits"], dim=-1) == labels.long())
             valid_metrics = new_carry.halted
+            # print(f"valid Metrics: {valid_metrics}")
             accuracy = torch.where(valid_metrics, is_correct.float(), 0).sum() 
             metrics = {
                 "count": valid_metrics.sum().float(),

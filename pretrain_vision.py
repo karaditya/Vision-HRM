@@ -256,7 +256,7 @@ def train_batch(train_state: TrainState, batch: Tuple[Tensor, Tensor], config: P
     metrics_list = []
 
     while not all_finish:
-        carry, loss, step_metrics, _, all_finish = train_state.model(carry=carry, batch=batch_dict, return_keys=config.eval_save_outputs)
+        carry, loss, step_metrics, _, all_finish = train_state.model(carry=carry, batch=batch_dict, return_keys=[])  
         (loss / config.global_batch_size).backward()
         metrics_list.append(step_metrics)
         if not all_finish:
@@ -297,7 +297,7 @@ def train_batch(train_state: TrainState, batch: Tuple[Tensor, Tensor], config: P
         return out
     return None
 
-def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_size: int):
+def evaluate(config: PretrainVisionConfig,train_state: TrainState, eval_loader: DataLoader, rank: int, world_size: int):
     train_state.model.eval()
     all_metrics = []
     keys = None
@@ -308,18 +308,29 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
             inputs, labels = batch
             batch_dict = {"inputs": inputs.to(model_device), "labels": labels.to(model_device)}
             carry = train_state.model.initial_carry(batch_dict) # type: ignore
+
             step_metrics_list = []
-            
-            while not carry.halted.all():
-                carry, _, step_metrics, _, _ = train_state.model(carry=carry, batch=batch_dict, return_keys=[])
+            all_finish = False
+
+            # step_count = 0
+            while True:
+                carry, _, step_metrics, _, all_finish = train_state.model(carry=carry, batch=batch_dict, return_keys=config.eval_save_outputs)
+                # step_count += 1
+                # print(f"Step {step_count}, Metrics: {step_metrics}")
+                # print("\n")
                 step_metrics_list.append(step_metrics)
-            
+                
+                if all_finish:
+                    break 
+          
             # Aggregate metrics across steps for this batch
             if step_metrics_list:
                 if keys is None:
                     keys = sorted(step_metrics_list[0].keys())
                 vals = torch.stack([torch.stack([m[k] for m in step_metrics_list]).sum(dim=0) for k in keys])
                 all_metrics.append(vals)
+    
+    
 
     if not all_metrics or keys is None:
         return {}
@@ -332,13 +343,14 @@ def evaluate(train_state: TrainState, eval_loader: DataLoader, rank: int, world_
         dist.all_reduce(vals)
 
     # Only rank 0 computes and returns metrics
+    
     if rank == 0:
         total_count = vals[keys.index("count")].item()
         if total_count == 0:
             return {}
         
         eval_metrics = {
-            f"eval/{k}": (v.item() / total_count if k == "accuracy" else v.item()) 
+            f"test/{k}": (v.item() / total_count if k == "accuracy" else v.item()) 
             for k, v in zip(keys, vals)
         }
         return eval_metrics
@@ -390,9 +402,11 @@ def main(hydra_config: DictConfig):
                 metrics["epoch"] = epoch + 1
                 pbar.set_postfix({k.split('/')[-1]: f"{v:.3f}" for k, v in metrics.items()})
                 wandb.log(metrics, step=train_state.step)
-
+     
         if (epoch + 1) % (config.eval_interval or 1) == 0:
-            eval_metrics = evaluate(train_state, eval_loader, RANK, WORLD_SIZE)
+            
+            eval_metrics = evaluate(config, train_state, eval_loader, RANK, WORLD_SIZE)
+            print(f"Eval Metric: {eval_metrics}")
             if RANK == 0 and eval_metrics:
                 eval_metrics["epoch"] = epoch + 1
                 print("Evaluation metrics:", {k: f"{v:.4f}" for k, v in eval_metrics.items()})

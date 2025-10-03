@@ -345,7 +345,7 @@ class HierarchicalReasoningModel_VisionV1(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
     
-    def forward(self, carry: HierarchicalReasoningModel_VisionV1Carry, batch: Dict[str, Tensor], return_keys: Optional[list] = None) -> Tuple[HierarchicalReasoningModel_VisionV1Carry, Dict[str, Tensor]]:
+    def forward(self, carry: HierarchicalReasoningModel_VisionV1Carry, batch: Dict[str, Tensor]) -> Tuple[HierarchicalReasoningModel_VisionV1Carry, Dict[str, Tensor]]:
         """Forward pass for vision HRM with ACT."""
         # Update data, reset halted sequences
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)

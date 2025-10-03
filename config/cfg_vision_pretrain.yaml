@@ -27,4 +27,4 @@ checkpoint_path: null
 seed: 42
 checkpoint_every_eval: true
 eval_interval: 1
-eval_save_outputs: ["logits", "predictions"]
+# eval_save_outputs: ["logits", "predictions"]
