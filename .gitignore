@@ -172,5 +172,7 @@ cuda_installer.run
 data/
 hrmEnv/
 tmp/
-wandb/
+
 outputs/
+train_vision_hrm.slurm
+models/hrm/grok_out.py

@@ -295,23 +295,16 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
             pos_ids = torch.arange(self.seq_len_tokens, device=input_embeddings.device).unsqueeze(0)
             input_embeddings = input_embeddings + self.embed_pos(pos_ids)
         
-        # Forward iterations
-        with torch.no_grad():
-            z_H, z_L = carry.H_hidden, carry.L_hidden
+        # Forward iterations with full auto-regression
+        z_H, z_L = carry.H_hidden, carry.L_hidden
 
-            for _H_step in range(self.config.H_cycles):
-                for _L_step in range(self.config.L_cycles):
-                    if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin)
+        for _ in range(self.config.H_cycles):
+            for _ in range(self.config.L_cycles):
 
-                if not (_H_step == self.config.H_cycles - 1):
-                    z_H = self.H_level(z_H, z_L, cos_sin)
+                z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin)
 
-        assert not z_H.requires_grad and not z_L.requires_grad
-
-        # 1-step grad
-        z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin)
-        z_H = self.H_level(z_H, z_L, cos_sin)
+            
+            z_H = self.H_level(z_H, z_L, cos_sin)
 
         # Classification on z_H
         logits = self.classification_head(z_H)
