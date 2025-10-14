@@ -17,6 +17,7 @@ weight_decay: 0.01
 beta1: 0.9
 beta2: 0.999
 
+use_cnn: true
 
 # Names
 project_name: CIFAR-Vision-HRM

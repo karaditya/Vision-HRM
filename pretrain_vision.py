@@ -30,7 +30,7 @@ from models.hrm.hrm_vision_v1 import HierarchicalReasoningModel_VisionV1Carry, H
 
 
 
-from dataset.common import PreprocessedCIFARDataset 
+from dataset.common import PreprocessedCIFARDataset, PreprocessedCIFARDataset_CNN 
 
 
 
@@ -68,6 +68,8 @@ class PretrainVisionConfig(pydantic.BaseModel):
     beta1: float
     beta2: float
 
+    use_cnn: bool = False
+
     # Names
     project_name: Optional[str] = None
     run_name: Optional[str] = None
@@ -100,17 +102,18 @@ def cosine_schedule_with_warmup_lr_lambda(
     return min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
 
-def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: int, world_size: int):
+def create_dataloader(data_path: str, split: str, global_batch_size: int, rank: int, world_size: int, use_cnn: bool = False):
     """
     Creates a DataLoader using the PreprocessedCIFARDataset.
     """
     # The data directory for the specific split
     split_data_dir = os.path.join(data_path, split)
 
-    # Instantiate our new, efficient dataset class
-    dataset = PreprocessedCIFARDataset(data_dir=split_data_dir)
+    if use_cnn:
+        dataset = PreprocessedCIFARDataset_CNN(data_dir=split_data_dir)
+    else:
+        dataset = PreprocessedCIFARDataset(data_dir=split_data_dir)
     
-    # Get metadata directly from the dataset object
     metadata = dataset.metadata
 
     sampler: Optional[DistributedSampler] = None
@@ -379,8 +382,8 @@ def main(hydra_config: DictConfig):
     torch.manual_seed(config.seed + RANK)
     np.random.seed(config.seed + RANK)
 
-    train_loader, train_metadata = create_dataloader(config.data_path, "train", config.global_batch_size, RANK, WORLD_SIZE)
-    eval_loader, _ = create_dataloader(config.data_path, "test", config.global_batch_size, RANK, WORLD_SIZE)
+    train_loader, train_metadata = create_dataloader(config.data_path, "train", config.global_batch_size, RANK, WORLD_SIZE, config.use_cnn)
+    eval_loader, _ = create_dataloader(config.data_path, "test", config.global_batch_size, RANK, WORLD_SIZE, config.use_cnn)
     train_state = init_train_state(config, train_metadata, WORLD_SIZE)
 
     if RANK == 0:

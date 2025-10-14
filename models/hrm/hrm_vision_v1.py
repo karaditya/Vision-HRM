@@ -10,6 +10,7 @@ from torch import Tensor
 from models.common import trunc_normal_init_
 from models.layers import SwiGLU, RotaryEmbedding, CastedEmbedding, CastedLinear, CosSin, apply_rotary_pos_emb, rms_norm
 
+import torchvision.models as models
 
 @dataclass
 class HierarchicalReasoningModel_VisionV1InnerCarry:
@@ -48,7 +49,7 @@ class HierarchicalReasoningModel_VisionV1Config:
     # ACT parameters
     halt_exploration_prob: float
     halt_max_steps: int
-    
+
     # Training
     batch_size: int
     forward_dtype: str = "bfloat16"
@@ -57,6 +58,12 @@ class HierarchicalReasoningModel_VisionV1Config:
     pos_encodings: str = "rope"
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-5
+
+    # Use CNN backbone
+    use_cnn: bool = False
+    cnn_backbone: str = "resnet18"  # or "efficientnet_b0"
+
+
 
 
 class VisionPatchEmbedding(nn.Module):
@@ -216,6 +223,24 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_VisionV1Config) -> None:
         super().__init__()
         self.config = config
+
+
+
+        if self.config.use_cnn:   
+            if self.config.cnn_backbone == "resnet18":
+                self.cnn_backbone = models.resnet18(weights=None)
+                self.cnn_backbone.fc = nn.Linear(512, self.config.num_classes)  # Only change final layer
+            elif self.config.cnn_backbone == "resnet50":
+                self.cnn_backbone = models.resnet50(weights=None)
+                self.cnn_backbone.fc = nn.Linear(2048, self.config.num_classes)
+            elif self.config.cnn_backbone == "efficientnet_b0":
+                self.cnn_backbone = models.efficientnet_b0(weights=None)
+                self.cnn_backbone.classifier[1] = nn.Linear(1280, self.config.num_classes)
+            elif self.config.cnn_backbone == "efficientnet_b1":
+                self.cnn_backbone = models.efficientnet_b1(weights=None)
+                self.cnn_backbone.classifier[1] = nn.Linear(1280, self.config.num_classes)
+        
+
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.embed_scale = math.sqrt(self.config.hidden_size)
         
@@ -285,35 +310,37 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
     
     def forward(self, carry: HierarchicalReasoningModel_VisionV1InnerCarry, batch: Dict[str, Tensor]) -> Tuple[HierarchicalReasoningModel_VisionV1InnerCarry, Tensor, Tensor]:
         """Forward pass for vision HRM inner."""
-        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
-        
-        # Input encoding
-        input_embeddings = self.patch_embedding(batch["inputs"])
-        
-        # Add learned positions if applicable
-        if self.config.pos_encodings == "learned":
-            pos_ids = torch.arange(self.seq_len_tokens, device=input_embeddings.device).unsqueeze(0)
-            input_embeddings = input_embeddings + self.embed_pos(pos_ids)
-        
-        # Forward iterations with full auto-regression
-        z_H, z_L = carry.H_hidden, carry.L_hidden
-
-        for _ in range(self.config.H_cycles):
-            for _ in range(self.config.L_cycles):
-
-                z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin)
-
+        if self.config.use_cnn:
+            # CNN mode - full ResNet/EfficientNet training
+            x = batch["inputs"]  # (B, C, H, W) 
             
-            z_H = self.H_level(z_H, z_L, cos_sin)
+            logits = self.cnn_backbone(x)
+            
+            # Dummy outputs for compatibility with training loop
+            q_logits = torch.zeros((x.size(0), 2), device=x.device, dtype=torch.float32)
+            new_carry = carry
+            
+        else:
+            # HRM mode (original code unchanged)
+            cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
+            input_embeddings = self.patch_embedding(batch["inputs"])
+            
+            if self.config.pos_encodings == "learned":
+                pos_ids = torch.arange(self.seq_len_tokens, device=input_embeddings.device).unsqueeze(0)
+                input_embeddings = input_embeddings + self.embed_pos(pos_ids)
+            
+            z_H, z_L = carry.H_hidden, carry.L_hidden
 
-        # Classification on z_H
-        logits = self.classification_head(z_H)
+            for _ in range(self.config.H_cycles):
+                for _ in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin)
+                z_H = self.H_level(z_H, z_L, cos_sin)
+
+            logits = self.classification_head(z_H)
+            cls_tokens = z_H[:, :1, :].squeeze(1)
+            q_logits = self.q_head(cls_tokens).to(torch.float32)
+            new_carry = HierarchicalReasoningModel_VisionV1InnerCarry(H_hidden=z_H.detach(), L_hidden=z_L.detach())
         
-        # Q logits on z_H cls tokens
-        cls_tokens = z_H[:, :1, :].squeeze(1)
-        q_logits = self.q_head(cls_tokens).to(torch.float32)
-        
-        new_carry = HierarchicalReasoningModel_VisionV1InnerCarry(H_hidden=z_H.detach(), L_hidden=z_L.detach())
         
         return new_carry, logits, q_logits
 

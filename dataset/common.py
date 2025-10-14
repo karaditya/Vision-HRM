@@ -67,6 +67,94 @@ class PreprocessedCIFARDataset(Dataset):
 # ***** ------------------------------------------------------------ *****
 
 
+# *****   FOR CIFAR VISION TASK WITH CNN *****
+
+class PreprocessedCIFARDataset_CNN(Dataset):
+    """
+    A PyTorch Dataset that loads pre-processed data from .npy files and
+    reconstructs images from patches for CNN training.
+    """
+    def __init__(self, data_dir: str):
+        """
+        Initializes the dataset.
+
+        Args:
+            data_dir (str): The directory containing 'all__inputs.npy', 
+                            'all__labels.npy', and 'dataset_metadata.json'.
+        """
+        self.data_dir = data_dir
+        
+        # Load metadata
+        with open(os.path.join(self.data_dir, "dataset_metadata.json"), "r") as f:
+            self.metadata = CIFARDatasetMetadata(**json.load(f))
+
+        # Load the numpy arrays using memory-mapping for efficiency
+        self.inputs = np.load(os.path.join(self.data_dir, "all__inputs.npy"), mmap_mode='r')
+        self.labels = np.load(os.path.join(self.data_dir, "all__labels.npy"), mmap_mode='r')
+
+        # Ensure the number of inputs and labels match
+        assert len(self.inputs) == len(self.labels), "Mismatch between number of inputs and labels."
+
+    def __len__(self) -> int:
+        """Returns the total number of samples in the dataset."""
+        return len(self.inputs)
+
+    def _patches_to_image(self, patches_flat: np.ndarray) -> np.ndarray:
+        """
+        Convert flattened patches back to image tensor.
+        
+        Args:
+            patches_flat: (seq_len,) flattened patches
+            
+        Returns:
+            image: (C, H, W) image tensor
+        """
+        P = self.metadata.patch_size
+        H = W = self.metadata.image_size
+        C = self.metadata.num_channels
+        num_patches = (H // P) ** 2
+        
+        # Reshape to patches: (num_patches, P*P*C)
+        patches = patches_flat.reshape(num_patches, P * P * C)
+        
+        # Reshape to: (H//P, W//P, P, P, C)
+        patches = patches.reshape(H // P, W // P, P, P, C)
+        
+        # Permute to: (C, H//P, P, W//P, P)
+        patches = np.transpose(patches, (4, 0, 2, 1, 3))
+        
+        # Reshape to: (C, H, W)
+        image = patches.reshape(C, H, W)
+        
+        return image
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Retrieves the sample at the given index as a 3D image.
+
+        Args:
+            idx (int): The index of the sample to retrieve.
+
+        Returns:
+            A tuple containing the image tensor (C, H, W) and the label tensor.
+        """
+        # Load flattened patches
+        patches_flat = self.inputs[idx].copy()
+        
+        # Reconstruct image
+        image = self._patches_to_image(patches_flat)
+        
+        # Convert to torch tensors
+        image_tensor = torch.from_numpy(image).float()
+        label_tensor = torch.tensor(self.labels[idx], dtype=torch.long)
+        
+        return image_tensor, label_tensor
+
+
+
+# ***** ------------------------------------------------------------ *****
+
+
 
 
 # *****   FOR PUZZLE SOLVING TASK *****
