@@ -76,8 +76,8 @@ class VisionPatchEmbedding(nn.Module):
             nn.Conv2d(embed_dim//2, embed_dim, kernel_size=4, stride=4)  # 4x4 patches for 32x32 -> 8x8=64 patches
         )
         
-        # Multi-class tokens (2 instead of 1)
-        self.cls_tokens = nn.Parameter(torch.zeros(1, 2, config.hidden_size))
+        # Class token
+        self.cls_tokens = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         
     def forward(self, x: Tensor) -> Tensor:
         batch_size = x.shape[0]
@@ -197,14 +197,14 @@ class VisionClassificationHead(nn.Module):
         self.config = config
         
         # Global average pooling + classification head
-        self.norm = nn.LayerNorm(config.hidden_size * 2)
-        self.classifier = CastedLinear(config.hidden_size * 2, config.num_classes, bias=True)  # *2 for multi-class tokens
-        
+        self.norm = nn.LayerNorm(config.hidden_size )
+        self.classifier = CastedLinear(config.hidden_size , config.num_classes, bias=True)  # Single class token
+
     def forward(self, x: Tensor) -> Tensor:
-        # Use both class tokens (first 2 tokens) for classification
-        cls_tokens = x[:, :2, :]  # (batch_size, 2, hidden_size)
-        cls_tokens = cls_tokens.flatten(1)  # (batch_size, 2*hidden_size)
-        
+        # Use class token (first token) for classification
+        cls_tokens = x[:, :1, :]  # (batch_size, 1, hidden_size)
+        cls_tokens = cls_tokens.squeeze(1)  # (batch_size, hidden_size)
+
         # Normalize and classify
         cls_tokens = self.norm(cls_tokens)
         logits = self.classifier(cls_tokens)
@@ -223,7 +223,7 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         self.patch_embedding = VisionPatchEmbedding(config)
         
         # Positional encodings
-        self.seq_len_tokens = 2 + (config.image_size // 4) ** 2  # 2 cls + patches (32/4=8, 8*8=64, total 66)
+        self.seq_len_tokens = 1 + (config.image_size // 4) ** 2  # 1 cls + patches (32/4=8, 8*8=64, total 65)
         if self.config.pos_encodings == "rope":
             self.rotary_emb = RotaryEmbedding(
                 dim=self.config.hidden_size // self.config.num_heads,
@@ -252,7 +252,7 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         self.classification_head = VisionClassificationHead(self.config)
         
         # Q head for ACT
-        self.q_head = CastedLinear(self.config.hidden_size * 2, 2, bias=True)  # On flattened cls tokens
+        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)  # On flattened cls tokens
         
         # Initial states (truncated normal init)
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1.0), persistent=True)
@@ -310,7 +310,7 @@ class HierarchicalReasoningModel_VisionV1_Inner(nn.Module):
         logits = self.classification_head(z_H)
         
         # Q logits on z_H cls tokens
-        cls_tokens = z_H[:, :2, :].flatten(1)
+        cls_tokens = z_H[:, :1, :].squeeze(1)
         q_logits = self.q_head(cls_tokens).to(torch.float32)
         
         new_carry = HierarchicalReasoningModel_VisionV1InnerCarry(H_hidden=z_H.detach(), L_hidden=z_L.detach())
@@ -381,7 +381,7 @@ class HierarchicalReasoningModel_VisionV1(nn.Module):
                 next_q_halt = next_q_logits[..., 0]
                 next_q_continue = next_q_logits[..., 1]
                 
-                outputs["target_q_continue"] = torch.where(is_last_step, next_q_halt, torch.maximum(next_q_halt, next_q_continue))
+                outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt, torch.maximum(next_q_halt, next_q_continue)))
         
         new_carry = HierarchicalReasoningModel_VisionV1Carry(new_inner_carry, new_steps, halted, new_current_data)
         
