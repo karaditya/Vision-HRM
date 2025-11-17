@@ -1,0 +1,38 @@
+# Language Model Training Configuration
+# Optimized for training tiny language models with HRM
+
+defaults:
+  - arch: hrm_lm_v1
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data path (will be created by build_text_dataset.py)
+data_path: data/text-lm
+
+# Training hyperparameters
+global_batch_size: 256  # Adjust based on available GPU memory
+epochs: 10000  # Number of training epochs
+eval_interval: 1000  # Evaluate every N epochs
+checkpoint_every_eval: true  # Save checkpoint after each evaluation
+
+# Learning rates
+lr: 3e-4  # Main learning rate (standard for small LMs)
+lr_min_ratio: 0.1  # Minimum LR as fraction of max (cosine decay)
+lr_warmup_steps: 500  # Warmup steps
+
+# Optimizer settings (following Llama/GPT conventions)
+beta1: 0.9  # Adam beta1
+beta2: 0.95  # Adam beta2 (0.95 is common for LMs)
+weight_decay: 0.1  # Weight decay for regularization
+
+# Puzzle embedding (not used for LM, but kept for compatibility)
+puzzle_emb_lr: 1e-4
+puzzle_emb_weight_decay: 0.1
+
+# Experiment tracking
+# project_name and run_name will be auto-generated if not specified
+# Uncomment to customize:
+# project_name: "tiny-lm-hrm"
+# run_name: "experiment-1"

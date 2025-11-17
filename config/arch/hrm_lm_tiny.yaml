@@ -1,0 +1,31 @@
+# Ultra-Tiny HRM Language Model Configuration
+# For extremely limited compute/memory scenarios
+# Target: <10M parameters
+
+name: hrm.hrm_lm_v1@HRMLM
+loss:
+  name: losses@ACTLossHead
+  loss_type: softmax_cross_entropy
+
+# ACT settings (minimal for speed)
+halt_exploration_prob: 0.1
+halt_max_steps: 4  # Fewer steps for faster training/inference
+
+# Minimal hierarchical reasoning
+H_cycles: 1  # Single high-level cycle
+L_cycles: 2  # Two low-level cycles
+
+# Minimal layer depths
+H_layers: 2  # Just 2 H-layers
+L_layers: 2  # Just 2 L-layers
+
+# Ultra-tiny dimensions
+hidden_size: 128  # Very small hidden size
+num_heads: 2  # Minimum viable heads
+expansion: 4  # Keep standard expansion
+
+# Efficient positional encodings
+pos_encodings: rope
+
+# Causal LM
+causal: true

@@ -1,0 +1,31 @@
+# Small HRM Language Model Configuration
+# Balanced configuration for moderate compute
+# Target: ~50M parameters
+
+name: hrm.hrm_lm_v1@HRMLM
+loss:
+  name: losses@ACTLossHead
+  loss_type: softmax_cross_entropy
+
+# ACT settings
+halt_exploration_prob: 0.1
+halt_max_steps: 16  # More steps for better reasoning
+
+# Standard hierarchical reasoning
+H_cycles: 3  # More abstract planning
+L_cycles: 3  # More detailed computation
+
+# Deeper layers
+H_layers: 6  # Deeper high-level reasoning
+L_layers: 6  # Deeper low-level processing
+
+# Larger dimensions
+hidden_size: 512  # Larger hidden size
+num_heads: 8  # More attention heads
+expansion: 4  # Standard expansion
+
+# Positional encodings
+pos_encodings: rope
+
+# Causal LM
+causal: true

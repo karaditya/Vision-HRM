@@ -1,0 +1,30 @@
+# HRM Language Model Architecture Configuration
+# Optimized for tiny language models with limited data and compute
+
+name: hrm.hrm_lm_v1@HRMLM
+loss:
+  name: losses@ACTLossHead
+  loss_type: softmax_cross_entropy  # Standard cross-entropy for LM
+
+# Adaptive Computation Time (ACT) settings
+halt_exploration_prob: 0.1  # Exploration probability for Q-learning
+halt_max_steps: 8  # Maximum reasoning steps (lower for faster inference)
+
+# Hierarchical reasoning cycles
+H_cycles: 2  # High-level cycles (abstract planning)
+L_cycles: 2  # Low-level cycles per H-cycle (detailed computation)
+
+# Layer depths (smaller for tiny models)
+H_layers: 3  # High-level transformer layers
+L_layers: 3  # Low-level transformer layers
+
+# Model dimensions (tiny model settings)
+hidden_size: 256  # Hidden dimension
+num_heads: 4  # Attention heads (hidden_size // 64 is common)
+expansion: 4  # MLP expansion ratio (standard is 4)
+
+# Positional encodings
+pos_encodings: rope  # RoPE is more parameter-efficient than learned
+
+# Language modeling specific
+causal: true  # Must be true for autoregressive LM
