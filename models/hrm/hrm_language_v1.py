@@ -1,19 +1,15 @@
 """
 HRM Language Model - Adapted for Text Generation and RAG Tasks
 Hierarchical Reasoning Model for natural language processing
+Self-contained implementation with all necessary components
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
-
-from models.layers import (
-    Attention,
-    SwiGLUFeedForward,
-    RMSNorm,
-    RoPE,
-)
+import math
 
 
 @dataclass
@@ -23,7 +19,7 @@ class HRMLanguageConfig:
     max_seq_len: int = 2048  # Maximum sequence length
     hidden_size: int = 512  # Hidden dimension
     num_heads: int = 8  # Number of attention heads
-    num_layers: int = 6  # Number of transformer layers
+    num_layers: int = 6  # Number of transformer layers per module
 
     # HRM-specific: Hierarchical reasoning
     H_cycles: int = 2  # High-level reasoning cycles
@@ -38,6 +34,179 @@ class HRMLanguageConfig:
         assert self.hidden_size % self.num_heads == 0, "hidden_size must be divisible by num_heads"
 
 
+# ============================================================================
+# Core Components
+# ============================================================================
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return output * self.weight
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE)"""
+
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        # Precompute frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Precompute cos and sin for max sequence length
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to query and key tensors"""
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+
+        # q, k shape: (batch, seq_len, num_heads, head_dim)
+        # cos, sin shape: (seq_len, head_dim)
+        q_embed = (q * cos.unsqueeze(0).unsqueeze(2)) + (self.rotate_half(q) * sin.unsqueeze(0).unsqueeze(2))
+        k_embed = (k * cos.unsqueeze(0).unsqueeze(2)) + (self.rotate_half(k) * sin.unsqueeze(0).unsqueeze(2))
+
+        return q_embed, k_embed
+
+
+class MultiHeadAttention(nn.Module):
+    """Multi-head self-attention with optional RoPE"""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        use_rope: bool = True,
+        max_seq_len: int = 2048,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.dropout = dropout
+        self.use_rope = use_rope
+
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+
+        # QKV projection
+        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Dropout
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        # RoPE
+        if use_rope:
+            self.rope = RotaryPositionalEmbedding(self.head_dim, max_seq_len)
+        else:
+            self.rope = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, hidden_size)
+            mask: (seq_len, seq_len) causal mask
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # QKV projection
+        qkv = self.qkv_proj(x)  # (batch, seq_len, 3 * hidden_size)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch, num_heads, seq_len, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Apply RoPE if enabled
+        if self.rope is not None:
+            # Reshape for RoPE: (batch, seq_len, num_heads, head_dim)
+            q_rope = q.permute(0, 2, 1, 3)
+            k_rope = k.permute(0, 2, 1, 3)
+            q_rope, k_rope = self.rope.apply_rotary_pos_emb(q_rope, k_rope, seq_len)
+            q = q_rope.permute(0, 2, 1, 3)
+            k = k_rope.permute(0, 2, 1, 3)
+
+        # Attention: (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len)
+        # -> (batch, num_heads, seq_len, seq_len)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply causal mask if provided
+        if mask is not None:
+            attn_weights = attn_weights + mask
+
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, v)  # (batch, num_heads, seq_len, head_dim)
+
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (batch, seq_len, num_heads, head_dim)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
+
+        output = self.o_proj(attn_output)
+        output = self.resid_dropout(output)
+
+        return output
+
+
+class SwiGLUFeedForward(nn.Module):
+    """SwiGLU Feed-Forward Network"""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion_factor: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        # Typical FFN uses 4x expansion, but we adjust to match SwiGLU pattern
+        # SwiGLU typically uses ~(8/3) * hidden_size
+        ffn_dim = int(expansion_factor * hidden_size * 2 / 3)
+        # Round to nearest multiple of 256 for efficiency
+        ffn_dim = ((ffn_dim + 255) // 256) * 256
+
+        self.gate_proj = nn.Linear(hidden_size, ffn_dim, bias=False)
+        self.up_proj = nn.Linear(hidden_size, ffn_dim, bias=False)
+        self.down_proj = nn.Linear(ffn_dim, hidden_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """SwiGLU activation: swish(gate) * up"""
+        gate = F.silu(self.gate_proj(x))  # SiLU = Swish
+        up = self.up_proj(x)
+        return self.dropout(self.down_proj(gate * up))
+
+
+# ============================================================================
+# HRM Components
+# ============================================================================
+
 class HierarchicalModule(nn.Module):
     """Single hierarchical reasoning module (H-level or L-level)"""
 
@@ -50,7 +219,7 @@ class HierarchicalModule(nn.Module):
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 'attn_norm': RMSNorm(config.hidden_size),
-                'attention': Attention(
+                'attention': MultiHeadAttention(
                     hidden_size=config.hidden_size,
                     num_heads=config.num_heads,
                     dropout=config.dropout,
@@ -74,7 +243,7 @@ class HierarchicalModule(nn.Module):
         """
         Args:
             x: (batch_size, seq_len, hidden_size)
-            mask: (batch_size, seq_len) - causal mask
+            mask: (seq_len, seq_len) - causal mask
         """
         for layer in self.layers:
             # Pre-norm attention
@@ -285,6 +454,8 @@ def create_hrm_language_model(config: Optional[HRMLanguageConfig] = None) -> HRM
 
 if __name__ == "__main__":
     # Test the model
+    print("Testing HRM Language Model...")
+
     config = HRMLanguageConfig(
         vocab_size=32000,
         max_seq_len=512,
@@ -313,3 +484,4 @@ if __name__ == "__main__":
     print(f"\nGeneration test:")
     print(f"  Prompt shape: {prompt.shape}")
     print(f"  Generated shape: {generated.shape}")
+    print(f"\n✓ All tests passed!")
