@@ -21,6 +21,9 @@ This guide walks you through training a Hierarchical Reasoning Model (HRM) for l
 # Core dependencies
 pip install torch numpy tqdm
 
+# For standard datasets (OpenWebText, C4, The Pile, etc.)
+pip install datasets
+
 # Optional for REST API
 pip install flask flask-cors
 ```
@@ -38,7 +41,40 @@ python -c "import torch; print(f'PyTorch {torch.__version__} installed, CUDA ava
 
 The model can train on **any text data**. Choose one:
 
-#### Option A: Use Your Own Data
+#### Option A: Use Standard Datasets (Recommended for Production)
+
+**NEW**: Train on the same datasets used by ChatGPT, LLaMA, and DeepSeek!
+
+```bash
+# See all available datasets
+python train_language_model.py --list_datasets
+
+# Use WikiText (good for testing, 500MB)
+python train_language_model.py \
+    --dataset wikitext \
+    --output_dir outputs/wikitext_model \
+    --hidden_size 256 \
+    --num_epochs 10
+
+# Use OpenWebText (GPT-2 style, 40GB)
+python train_language_model.py \
+    --dataset openwebtext \
+    --output_dir outputs/openwebtext_model \
+    --hidden_size 512 \
+    --num_epochs 3 \
+    --use_streaming
+
+# Use C4 (Large-scale, 750GB)
+python train_language_model.py \
+    --dataset c4 \
+    --output_dir outputs/c4_model \
+    --hidden_size 768 \
+    --use_streaming
+```
+
+**📚 See [DATASETS_GUIDE.md](DATASETS_GUIDE.md) for complete documentation on all datasets.**
+
+#### Option B: Use Your Own Data
 
 Create a text file with your content:
 ```bash
@@ -51,14 +87,14 @@ Add more content to improve training.
 EOF
 ```
 
-#### Option B: Use Sample Data (for testing)
+#### Option C: Use Sample Data (for testing)
 
 ```bash
 # Download sample data (Shakespeare, Wikipedia, etc.)
 wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt -O data.txt
 ```
 
-#### Option C: Use Multiple Files
+#### Option D: Use Multiple Files
 
 ```bash
 # Create a directory with multiple text files
