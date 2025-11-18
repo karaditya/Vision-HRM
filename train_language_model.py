@@ -11,12 +11,13 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import argparse
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 import json
 from tqdm import tqdm
 import numpy as np
 
 from models.hrm.hrm_language_v1 import HRMLanguageModel, HRMLanguageConfig
+from dataset_loader import StreamingTextDataset, PretrainingDatasetRegistry
 
 
 class TextDataset(Dataset):
@@ -296,50 +297,119 @@ def main(args):
     else:
         print("Building tokenizer...")
         # Load all texts for vocab building
-        path = Path(args.data_path)
-        if path.is_file():
-            with open(path, 'r', encoding='utf-8') as f:
-                all_texts = [line.strip() for line in f if line.strip()]
-        else:
-            all_texts = []
-            for file_path in path.glob('**/*.txt'):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    all_texts.extend([line.strip() for line in f if line.strip()])
+        all_texts = []
+
+        if args.data_path:
+            path = Path(args.data_path)
+            if path.is_file():
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    all_texts = [line.strip() for line in f if line.strip()]
+            elif path.is_dir():
+                for file_path in path.glob('**/*.txt'):
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        all_texts.extend([line.strip() for line in f if line.strip()])
+        elif args.dataset:
+            # For HuggingFace datasets, sample some texts for vocab building
+            print("Sampling from dataset for vocabulary building...")
+            temp_dataset = PretrainingDatasetRegistry.create_dataset(
+                args.dataset,
+                None,  # No tokenizer yet
+                max_seq_len=512,
+                streaming=True,
+                split="train"
+            )
+            # Sample first 10000 texts
+            for i, text in enumerate(temp_dataset._load_huggingface_dataset()):
+                if i >= 10000:
+                    break
+                all_texts.append(text)
+
+        if not all_texts:
+            all_texts = ["This is a sample sentence for tokenizer initialization."]
+            print("Warning: No training texts found for vocabulary building. Using default.")
 
         tokenizer = SimpleTokenizer(vocab_size=args.vocab_size, level=args.tokenizer_level)
         tokenizer.build_vocab(all_texts[:10000])  # Use subset for vocab building
         tokenizer.save(str(tokenizer_path))
 
     # Create datasets
-    train_dataset = TextDataset(
-        args.data_path,
-        tokenizer,
-        max_seq_len=args.max_seq_len,
-        train=True,
-    )
+    use_streaming = args.dataset is not None or args.use_streaming
 
-    # Split into train/val
-    train_size = int(0.9 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        train_dataset, [train_size, val_size]
-    )
+    if args.dataset:
+        # Use registered dataset (HuggingFace, etc.)
+        print(f"\nUsing registered dataset: {args.dataset}")
+        train_dataset = PretrainingDatasetRegistry.create_dataset(
+            args.dataset,
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            streaming=args.use_streaming,
+            split="train",
+        )
+        val_dataset = PretrainingDatasetRegistry.create_dataset(
+            args.dataset,
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            streaming=args.use_streaming,
+            split="validation" if not args.use_streaming else "train",  # Some datasets don't have validation split
+        )
+    elif use_streaming:
+        # Use streaming dataset for large files
+        print(f"\nUsing streaming dataset from: {args.data_path}")
+        train_dataset = StreamingTextDataset(
+            args.data_path,
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            dataset_type=args.dataset_type,
+            streaming=True,
+        )
+        val_dataset = train_dataset  # For streaming, we use same dataset
+    else:
+        # Use simple in-memory dataset
+        print(f"\nUsing simple in-memory dataset from: {args.data_path}")
+        train_dataset = TextDataset(
+            args.data_path,
+            tokenizer,
+            max_seq_len=args.max_seq_len,
+            train=True,
+        )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
+        # Split into train/val
+        train_size = int(0.9 * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size]
+        )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
+    # Create data loaders
+    if use_streaming:
+        # For streaming datasets, don't shuffle and use num_workers=0
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=0,  # Streaming datasets work best with single worker
+            collate_fn=collate_fn,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+        )
 
     # Create model
     config = HRMLanguageConfig(
@@ -414,7 +484,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train HRM Language Model")
 
     # Data
-    parser.add_argument('--data_path', type=str, required=True, help='Path to training data')
+    parser.add_argument('--data_path', type=str, default=None, help='Path to training data (text file, directory, JSONL, etc.)')
+    parser.add_argument('--dataset', type=str, default=None, help='Use registered dataset (openwebtext, wikitext, c4, etc.). Run with --list_datasets to see all.')
+    parser.add_argument('--list_datasets', action='store_true', help='List available datasets and exit')
+    parser.add_argument('--dataset_type', type=str, default='auto', choices=['auto', 'text', 'jsonl', 'parquet', 'huggingface'], help='Dataset type')
+    parser.add_argument('--use_streaming', action='store_true', help='Use streaming for large datasets (recommended for >1GB)')
     parser.add_argument('--output_dir', type=str, default='outputs/hrm_lm', help='Output directory')
 
     # Tokenizer
@@ -441,4 +515,14 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
     args = parser.parse_args()
+
+    # Handle list datasets
+    if args.list_datasets:
+        PretrainingDatasetRegistry.list_datasets()
+        exit(0)
+
+    # Validate arguments
+    if args.data_path is None and args.dataset is None:
+        parser.error("Either --data_path or --dataset must be specified")
+
     main(args)
